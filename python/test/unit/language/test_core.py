@@ -2498,12 +2498,18 @@ def test_chain_reduce(M, N, src_layout, op, device, first_axis):
     np.testing.assert_allclose(z_ref, z_tri.cpu().numpy(), rtol=0.01, atol=1e-3)
 
 
-def test_generic_reduction(device):
-    if is_hip():
-        pytest.skip(
-            'test_generic_reduction for HIP currently broken in https://github.com/openai/triton. Use https://github.com/ROCmSoftwarePlatform/triton'
-        )
-
+@triton.jit
+def _welford_combine(mean_1, m2_1, weight_1, mean_2, m2_2, weight_2):
+    delta = mean_2 - mean_1
+    new_weight = weight_1 + weight_2
+    w2_over_w = weight_2 / new_weight
+    return (
+        mean_1 + delta * w2_over_w,
+        m2_1 + m2_2 + delta * delta * weight_1 * w2_over_w,
+        new_weight,
+    )
+@pytest.mark.parametrize("dtype_str", ["float32", "float64"])
+def test_generic_reduction(dtype_str, device):
     @triton.jit
     def var_mean_kernel(X, out_mean, out_var, BLOCK: tl.constexpr):
         xindex = tl.arange(0, BLOCK)
@@ -2516,9 +2522,9 @@ def test_generic_reduction(device):
         tl.store(out_var, m2 / weight)
 
     SIZE = 512
-    x = torch.rand(SIZE, device=device)
-    out_mean = torch.empty((), device=device)
-    out_var = torch.empty((), device=device)
+    x = torch.rand(SIZE, dtype = getattr(torch, dtype_str), device = device)
+    out_mean = torch.empty((), dtype = getattr(torch, dtype_str), device = device)
+    out_var = torch.empty((), dtype = getattr(torch, dtype_str), device = device)
 
     var_mean_kernel[(1, )](x, out_mean, out_var, BLOCK=SIZE)
 
