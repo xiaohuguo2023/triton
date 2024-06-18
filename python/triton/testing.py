@@ -80,13 +80,23 @@ def do_bench_cudagraph(fn, rep=20, grad_to_none=None, return_mode="mean"):
     times = torch.tensor(ret)
     return getattr(torch, return_mode)(times).item()
 
-def get_time_us_sync():
-    # Synchronize the CUDA device to ensure accurate timing
-    torch.cuda.synchronize()
-    # Get the current time in microseconds since epoch
-    now = time.time()
-    duration = now * 1e6  # Convert seconds to microseconds
-    return duration
+class Timer:
+    def __init__(self):
+        self.start_time = None
+
+    def tic(self):
+        """Start the CPU timer and synchronize the CUDA device."""
+        torch.cuda.synchronize()
+      #  self.start_time = time.perf_counter()
+        self.start_time = time.time()
+
+    def toc(self):
+        """Stop the CPU timer and calculate the elapsed time in milliseconds."""
+        torch.cuda.synchronize()
+     #   end_time = time.perf_counter()
+        end_time = time.time()
+        elapsed_time_ms = (end_time - self.start_time) * 1e3  # Convert seconds to milliseconds
+        return elapsed_time_ms
 
 def do_bench1(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
     """
@@ -101,10 +111,10 @@ def do_bench1(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_fl
     :param grad_to_none: Reset the gradient of the provided tensor to None
     :type grad_to_none: torch.tensor, optional
     :param quantiles: Performance percentile to return in addition to the median.
-    :type quantiles: list[float]
-    :param fast_flush: Use faster kernel to flush L2 between measurements
-    :type fast_flush: bool
-    :param return_mode: Summary statistic to return ("min", "max", "mean", "median")
+    :type quantiles: list[float], optional
+    :param fast_flush: Use faster kernel to flush L2 cache between measurements
+    :type fast_flush: bool, default is True
+    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", or "median". Default is "mean".
     :type return_mode: str
     """
     assert return_mode in ["min", "max", "mean", "median"]
@@ -113,12 +123,271 @@ def do_bench1(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_fl
     torch.cuda.synchronize()
 
     # We maintain a buffer of 256 MB that we clear
-    # before each kernel call to make sure that the L2
+    # before each kernel call to make sure that the L2 cache
     # doesn't contain any input data before the run
+    cache_size = 256 * 1024 * 1024
     if fast_flush:
-        cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
+        cache = torch.empty(int(cache_size // 4), dtype=torch.int, device='cuda')
     else:
-        cache = torch.empty(int(256e6), dtype=torch.int8, device='cuda')
+        cache = torch.empty(int(cache_size), dtype=torch.int8, device='cuda')
+
+    # Estimate the runtime of the function
+    timer = Timer()
+    timer.tic()
+    for _ in range(5):
+        cache.zero_()
+        fn()
+    estimate_time = timer.toc() / 5
+
+    # compute number of warmup and repeat
+    n_warmup = max(1, int(warmup / estimate_time))
+    n_repeat = max(1, int(rep / estimate_time))
+
+    # Warm-up
+    for _ in range(n_warmup):
+        fn()
+
+    # Benchmark
+    times = []
+    for i in range(n_repeat):
+        # we don't want `fn` to accumulate gradient values
+        # if it contains a backward pass. So we clear the
+        # provided gradients
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.grad = None
+        # we clear the L2 cache before each run
+        cache.zero_()
+        # record time of `fn`
+        timer.tic()
+        fn()
+        elapsed_time = timer.toc()
+        times.append(elapsed_time)
+
+    times = torch.tensor(times, dtype=torch.float)
+    if quantiles is not None:
+        ret = torch.quantile(times, torch.tensor(quantiles, dtype=torch.float)).tolist()
+        if len(ret) == 1:
+            ret = ret[0]
+        return ret
+    return getattr(torch, return_mode)(times).item()
+
+##def tic():
+##    """Start the CPU timer and synchronize the CUDA device."""
+##    torch.cuda.synchronize()
+##    start_time = time.perf_counter()
+##    return start_time
+##
+##def toc(start_time):
+##    """Stop the CPU timer and calculate the elapsed time in milliseconds."""
+##    torch.cuda.synchronize()
+##    end_time = time.perf_counter()
+##    elapsed_time_ms = (end_time - start_time) * 1e3  # Convert seconds to milliseconds
+##    return elapsed_time_ms
+##
+##def do_bench1(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
+##    """
+##    Benchmark the runtime of the provided function using both CPU and GPU timers.
+##
+##    :param fn: Function to benchmark
+##    :type fn: Callable
+##    :param warmup: Warmup time (in ms)
+##    :type warmup: int
+##    :param rep: Repetition time (in ms)
+##    :type rep: int
+##    :param grad_to_none: Reset the gradient of the provided tensor to None
+##    :type grad_to_none: torch.tensor, optional
+##    :param quantiles: Performance percentile to return in addition to the median.
+##    :type quantiles: list[float], optional
+##    :param fast_flush: Use faster kernel to flush L2 cache between measurements
+##    :type fast_flush: bool, default is True
+##    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", or "median". Default is "mean".
+##    :type return_mode: str
+##    """
+##    assert return_mode in ["min", "max", "mean", "median"]
+##
+##    fn()
+##    torch.cuda.synchronize()
+##
+##    # We maintain a buffer of 256 MB that we clear
+##    # before each kernel call to make sure that the L2 cache
+##    # doesn't contain any input data before the run
+##    cache_size = 256 * 1024 * 1024
+##    if fast_flush:
+##        cache = torch.empty(int(cache_size // 4), dtype=torch.int, device='cuda')
+##    else:
+##        cache = torch.empty(int(cache_size), dtype=torch.int8, device='cuda')
+##
+##    # Estimate the runtime of the function
+##    start_time = tic()
+##    for _ in range(5):
+##        cache.zero_()
+##        fn()
+##    estimate_time = toc(start_time) / 5
+##
+##    # compute number of warmup and repeat
+##    n_warmup = max(1, int(warmup / estimate_time))
+##    n_repeat = max(1, int(rep / estimate_time))
+##
+##    # Warm-up
+##    for _ in range(n_warmup):
+##        fn()
+##
+##    # Benchmark
+##    times = []
+##    for i in range(n_repeat):
+##        # we don't want `fn` to accumulate gradient values
+##        # if it contains a backward pass. So we clear the
+##        # provided gradients
+##        if grad_to_none is not None:
+##            for x in grad_to_none:
+##                x.grad = None
+##        # we clear the L2 cache before each run
+##        cache.zero_()
+##        # record time of `fn`
+##        start_time = tic()
+##        fn()
+##        elapsed_time = toc(start_time)
+##        times.append(elapsed_time)
+##
+##    times = torch.tensor(times, dtype=torch.float)
+##    if quantiles is not None:
+##        ret = torch.quantile(times, torch.tensor(quantiles, dtype=torch.float)).tolist()
+##        if len(ret) == 1:
+##            ret = ret[0]
+##        return ret
+##    return getattr(torch, return_mode)(times).item()
+##
+####def get_time_ms_sync():
+####    # Synchronize the CUDA device to ensure accurate timing
+####    torch.cuda.synchronize()
+####    # Get the current time in microseconds since epoch
+####    now = time.time()
+####    duration = now * 1e6  # Convert seconds to microseconds
+####    return duration
+####def do_bench1(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
+####    """
+####    Benchmark the runtime of the provided function using both CPU and GPU timers.
+##
+##    :param fn: Function to benchmark
+##    :type fn: Callable
+##    :param warmup: Warmup time (in ms)
+##    :type warmup: int
+##    :param rep: Repetition time (in ms)
+##    :type rep: int
+##    :param grad_to_none: Reset the gradient of the provided tensor to None
+##    :type grad_to_none: torch.tensor, optional
+##    :param quantiles: Performance percentile to return in addition to the median.
+##    :type quantiles: list[float]
+##    :param fast_flush: Use faster kernel to flush L2 between measurements
+##    :type fast_flush: bool
+##    :param return_mode: Summary statistic to return ("min", "max", "mean", "median")
+##    :type return_mode: str
+##    """
+##    assert return_mode in ["min", "max", "mean", "median"]
+##
+##    fn()
+##    torch.cuda.synchronize()
+##
+##    # We maintain a buffer of 256 MB that we clear
+##    # before each kernel call to make sure that the L2
+##    # doesn't contain any input data before the run
+##    if fast_flush:
+##        cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
+##    else:
+##        cache = torch.empty(int(256e6), dtype=torch.int8, device='cuda')
+##
+##    # Estimate the runtime of the function
+##    start_event = torch.cuda.Event(enable_timing=True)
+##    end_event = torch.cuda.Event(enable_timing=True)
+##    start_event.record()
+##    for _ in range(5):
+##        cache.zero_()
+##        fn()
+##    end_event.record()
+##    torch.cuda.synchronize()
+##    estimate_ms = start_event.elapsed_time(end_event) / 5
+##
+##    # compute number of warmup and repeat
+##    n_warmup = max(1, int(warmup / estimate_ms))
+##    n_repeat = max(1, int(rep / estimate_ms))
+###    start_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
+###    end_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
+##
+##    # Warm-up
+##    for _ in range(n_warmup):
+##        fn()
+##
+##    # Benchmark
+##    cpu_times = []
+##    gpu_times = []
+##    # CPU timer start
+##    start_cpu = time.perf_counter()
+##    for i in range(n_repeat):
+##        if grad_to_none is not None:
+##            for x in grad_to_none:
+##                x.grad = None
+##        cache.zero_()
+##
+##
+##        # GPU timer start
+##    #    start_event[i].record()
+##        fn()
+##    #    end_event[i].record()
+##
+##    #    # CPU timer end
+##
+##    # Record clocks
+##    torch.cuda.synchronize()
+##    end_cpu = time.perf_counter()
+##    cpu_times=(end_cpu - start_cpu)/n_repeat
+###    gpu_times = [s.elapsed_time(e) / 1000 for s, e in zip(start_event, end_event)]  # convert ms to seconds
+##    gpu_times = cpu_times
+##
+##    if quantiles is not None:
+##        cpu_quantiles = torch.quantile(torch.tensor(cpu_times, dtype=torch.float), torch.tensor(quantiles, dtype=torch.float)).tolist()
+##        gpu_quantiles = torch.quantile(torch.tensor(gpu_times, dtype=torch.float), torch.tensor(quantiles, dtype=torch.float)).tolist()
+##        return cpu_quantiles, gpu_quantiles
+##
+##    cpu_time = getattr(torch, return_mode)(torch.tensor(cpu_times)).item()
+##    gpu_time = getattr(torch, return_mode)(torch.tensor(gpu_times)).item()
+##
+##    return cpu_time, gpu_time
+
+def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
+    """
+    Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
+    the 20-th and 80-th performance percentile.
+
+    :param fn: Function to benchmark
+    :type fn: Callable
+    :param warmup: Warmup time (in ms)
+    :type warmup: int
+    :param rep: Repetition time (in ms)
+    :type rep: int
+    :param grad_to_none: Reset the gradient of the provided tensor to None
+    :type grad_to_none: torch.tensor, optional
+    :param quantiles: Performance percentile to return in addition to the median.
+    :type quantiles: list[float], optional
+    :param fast_flush: Use faster kernel to flush L2 cache between measurements
+    :type fast_flush: bool, default is True
+    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", or "median". Default is "mean".
+    :type return_mode: str
+    """
+    assert return_mode in ["min", "max", "mean", "median"]
+    import torch
+
+    fn()
+    torch.cuda.synchronize()
+
+    # We maintain a buffer of 256 MB that we clear
+    # before each kernel call to make sure that the L2 cache
+    # doesn't contain any input data before the run
+    cache_size = 256 * 1024 * 1024
+    if fast_flush:
+        cache = torch.empty(int(cache_size // 4), dtype=torch.int, device='cuda')
+    else:
+        cache = torch.empty(int(cache_size), dtype=torch.int8, device='cuda')
 
     # Estimate the runtime of the function
     start_event = torch.cuda.Event(enable_timing=True)
@@ -134,96 +403,11 @@ def do_bench1(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_fl
     # compute number of warmup and repeat
     n_warmup = max(1, int(warmup / estimate_ms))
     n_repeat = max(1, int(rep / estimate_ms))
-#    start_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
-#    end_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
-
+    start_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
+    end_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
     # Warm-up
     for _ in range(n_warmup):
         fn()
-
-    # Benchmark
-    cpu_times = []
-    gpu_times = []
-    for i in range(n_repeat):
-        if grad_to_none is not None:
-            for x in grad_to_none:
-                x.grad = None
-        cache.zero_()
-
-        # CPU timer start
-        start_cpu = time.perf_counter()
-
-        # GPU timer start
-    #    start_event[i].record()
-        fn()
-    #    end_event[i].record()
-
-    #    # CPU timer end
-        end_cpu = time.perf_counter()
-        cpu_times.append(end_cpu - start_cpu)
-
-    # Record clocks
-    torch.cuda.synchronize()
-#    gpu_times = [s.elapsed_time(e) / 1000 for s, e in zip(start_event, end_event)]  # convert ms to seconds
-    gpu_times = cpu_times
-
-    if quantiles is not None:
-        cpu_quantiles = torch.quantile(torch.tensor(cpu_times, dtype=torch.float), torch.tensor(quantiles, dtype=torch.float)).tolist()
-        gpu_quantiles = torch.quantile(torch.tensor(gpu_times, dtype=torch.float), torch.tensor(quantiles, dtype=torch.float)).tolist()
-        return cpu_quantiles, gpu_quantiles
-
-    cpu_time = getattr(torch, return_mode)(torch.tensor(cpu_times)).item()
-    gpu_time = getattr(torch, return_mode)(torch.tensor(gpu_times)).item()
-
-    return cpu_time, gpu_time
-
-def do_bench(fn, warmup=2, rep=10, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
-    """
-    Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
-    the 20-th and 80-th performance percentile.
-
-    :param fn: Function to benchmark
-    :type fn: Callable
-    :param warmup: Warmup time (in ms)
-    :type warmup: int
-    :param rep: Repetition time (in ms)
-    :type rep: int
-    :param grad_to_none: Reset the gradient of the provided tensor to None
-    :type grad_to_none: torch.tensor, optional
-    :param quantiles: Performance percentile to return in addition to the median.
-    :type quantiles: list[float]
-    :param fast_flush: Use faster kernel to flush L2 between measurements
-    :type fast_flush: bool
-    """
-    assert return_mode in ["min", "max", "mean", "median"]
-
-    torch.cuda.synchronize()
-
-    # We maintain a buffer of 256 MB that we clear
-    # before each kernel call to make sure that the L2
-    # doesn't contain any input data before the run
-    if fast_flush:
-        cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
-    else:
-        cache = torch.empty(int(256e6), dtype=torch.int8, device='cuda')
-
-    # Estimate the runtime of the function
-    start_time = get_time_us_sync()
-    for _ in range(5):
-        cache.zero_()
-        fn()
-    end_time = get_time_us_sync()
-    estimate_us = (end_time - start_time) / 5
-
-    # compute number of warmup and repeat
-    n_warmup = max(1, int(warmup * 1000 / estimate_us))
-    n_repeat = max(1, int(rep * 1000 / estimate_us))
-    times = []
-
-    # Warm-up
-    for _ in range(n_warmup):
-        fn()
-
     # Benchmark
     for i in range(n_repeat):
         # we don't want `fn` to accumulate gradient values
@@ -235,13 +419,12 @@ def do_bench(fn, warmup=2, rep=10, grad_to_none=None, quantiles=None, fast_flush
         # we clear the L2 cache before each run
         cache.zero_()
         # record time of `fn`
-        start_time = get_time_us_sync()
+        start_event[i].record()
         fn()
-        end_time = get_time_us_sync()
-        times.append(end_time - start_time)
-
-    # Convert times to milliseconds
-    times = torch.tensor(times, dtype=torch.float) / 1000
+        end_event[i].record()
+    # Record clocks
+    torch.cuda.synchronize()
+    times = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
     if quantiles is not None:
         ret = torch.quantile(times, torch.tensor(quantiles, dtype=torch.float)).tolist()
         if len(ret) == 1:
