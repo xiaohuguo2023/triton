@@ -6,6 +6,8 @@
 #include "TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 
 #include "Utility.h"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
 using namespace mlir;
@@ -37,12 +39,13 @@ Value redundantDataMask(Type valueTy, ConversionPatternRewriter &rewriter,
     auto threadsPerWarp = triton::gpu::getThreadsPerWarp(layout);
     auto warpsPerCTA = triton::gpu::getWarpsPerCTA(layout);
     auto order = triton::gpu::getOrder(layout);
+    auto warpOrder = triton::gpu::getWarpOrder(layout);
     auto shapePerCTATile = triton::gpu::getShapePerCTATile(layout, shape);
     Value warpSize = i32_val(32);
     Value laneId = urem(tid, warpSize);
     Value warpId = udiv(tid, warpSize);
     SmallVector<Value> multiDimWarpId =
-        delinearize(rewriter, loc, warpId, warpsPerCTA, order);
+        delinearize(rewriter, loc, warpId, warpsPerCTA, warpOrder);
     SmallVector<Value> multiDimThreadId =
         delinearize(rewriter, loc, laneId, threadsPerWarp, order);
     for (unsigned dim = 0; dim < rank; ++dim) {
@@ -806,70 +809,73 @@ struct AsyncCopyGlobalToLocalOpConversion
     // %other
     SmallVector<Value> otherElems;
     if (llOther) {
-      // FIXME(Keren): always assume other is 0 for now
+      // FIXME(Keren): assume other is 0 for now.
+      //
       // It's not necessary for now because the pipeline pass will skip
       // generating insert_slice_async if the load op has any "other" tensor.
-      // assert(false && "insert_slice_async: Other value not supported yet");
       otherElems = unpackLLElements(loc, llOther, rewriter);
       assert(srcElems.size() == otherElems.size());
     }
 
-    // We don't use getVec() here because we are copying from memory to memory.
-    // If contiguity > vector size, we can have one pointer maintaining the
-    // start of the vector and the other pointer moving to the next vector.
-    unsigned inVec = getContiguity(op.getSrc());
-    unsigned outVec = resSharedLayout.getVec();
-    unsigned minVec = inVec;
-    if (outVec > 1)
-      minVec = std::min(outVec, inVec);
-    unsigned numElems = getTotalElemsPerThread(srcTy);
-    unsigned perPhase = resSharedLayout.getPerPhase();
-    unsigned maxPhase = resSharedLayout.getMaxPhase();
-    SmallVector<Value> offsetVals = {smemObj.strides.size(), i32_val(0)};
-    DenseMap<unsigned, Value> sharedPtrs = getSwizzledSharedPtrs(
-        loc, targetInfo, inVec, srcTy, resSharedLayout, resElemTy, smemObj,
-        rewriter, offsetVals, smemObj.strides);
+    // We can load N elements at a time if:
+    //  1. Every group of N source pointers are contiguous.  For example, if
+    //     N=2, then the pointers should be [x, x+1, y, y+1, ...].
+    //  2. The mask (if present) has "alignment" N, meaning that each group of N
+    //     mask bits are the same.  For example if N=2, the mask must be
+    //     [x, x, y, y, ...].
+    unsigned maxVec = getContiguity(op.getSrc());
+    if (mask) {
+      maxVec = std::min(maxVec, getMaskAlignment(mask));
+    }
 
-    // A sharedLayout encoding has a "vec" parameter.
-    // On the column dimension, if inVec > outVec, it means we have to divide
-    // single vector read into multiple ones
-    auto numVecCols = std::max<unsigned>(inVec / outVec, 1);
+    // Addresses to store into, one per `vecTy`.
+    VectorType vecTy;
+    SmallVector<Value> shmemAddrs;
+    bool ok = emitTransferBetweenRegistersAndShared(
+        srcTy, dstTy, resElemTy, maxVec, smemObj.base, smemObj.strides, loc,
+        rewriter, targetInfo, [&](VectorType vecTy_, Value shmemAddr) {
+          vecTy = vecTy_;
+          shmemAddrs.push_back(shmemAddr);
+        });
+    assert(ok);
 
-    for (unsigned elemIdx = 0; elemIdx < numElems; elemIdx += minVec) {
-      // 16 * 8 = 128bits
-      auto maxBitWidth =
-          std::max<unsigned>(128, resElemTy.getIntOrFloatBitWidth());
-      auto vecBitWidth = resElemTy.getIntOrFloatBitWidth() * minVec;
-      auto bitWidth = std::min<unsigned>(maxBitWidth, vecBitWidth);
-      auto numWords = vecBitWidth / bitWidth;
-      auto numWordElems = bitWidth / resElemTy.getIntOrFloatBitWidth();
+    int vecBytes = vecTy.getNumElements() * vecTy.getElementTypeBitWidth() / 8;
+    assert(llvm::isPowerOf2_32(vecBytes));
+    if (vecBytes < 4) {
+      return emitError(loc, "cp.async does not support transfers smaller than "
+                            "4 bytes; calculated this as ")
+             << vecBytes << " bytes";
+    }
 
-      // Tune CG and CA here.
-      auto byteWidth = bitWidth / 8;
-      CacheModifier srcCacheModifier =
-          byteWidth == 16 ? CacheModifier::CG : CacheModifier::CA;
-      assert(byteWidth == 16 || byteWidth == 8 || byteWidth == 4);
-      auto resByteWidth = resElemTy.getIntOrFloatBitWidth() / 8;
+    for (int i = 0; i < shmemAddrs.size(); i++) {
+      // It's possible that vecTy is larger than 128 bits, in which case we have
+      // to use multiple cp.async instructions.
+      int wordBytes = std::min(vecBytes, 16);
+      int wordElems = wordBytes * 8 / vecTy.getElementTypeBitWidth();
+      int numWordsInVec = std::max(1, vecBytes / wordBytes);
+      for (int j = 0; j < numWordsInVec; j++) {
+        int elemIdx = i * vecTy.getNumElements() + j * wordElems;
 
-      Value basePtr = sharedPtrs[elemIdx];
-      for (size_t wordIdx = 0; wordIdx < numWords; ++wordIdx) {
+        // Tune CG and CA.
+        CacheModifier srcCacheModifier =
+            wordBytes == 16 ? CacheModifier::CG : CacheModifier::CA;
+        assert(wordBytes == 16 || wordBytes == 8 || wordBytes == 4);
+
         PTXBuilder ptxBuilder;
-        auto wordElemIdx = wordIdx * numWordElems;
         auto &copyAsyncOp =
             *ptxBuilder.create<PTXCpAsyncLoadInstr>(srcCacheModifier);
-        auto *dstOperand =
-            ptxBuilder.newAddrOperand(basePtr, "r", wordElemIdx * resByteWidth);
-        auto *srcOperand =
-            ptxBuilder.newAddrOperand(srcElems[elemIdx + wordElemIdx], "l");
-        auto *copySize = ptxBuilder.newConstantOperand(byteWidth);
+        auto *dstOperand = ptxBuilder.newAddrOperand(shmemAddrs[i], "r",
+                                                     /*offset=*/j * wordBytes);
+        auto *srcOperand = ptxBuilder.newAddrOperand(srcElems[elemIdx], "l");
+        auto *copySize = ptxBuilder.newConstantOperand(wordBytes);
         auto *srcSize = copySize;
         if (op.getMask()) {
           // We don't use predicate in this case, setting src-size to 0
           // if there's any mask. cp.async will automatically fill the
           // remaining slots with 0 if cp-size > src-size.
           // XXX(Keren): Always assume other = 0 for now.
-          auto selectOp = select(maskElems[elemIdx + wordElemIdx],
-                                 i32_val(byteWidth), i32_val(0));
+          auto selectOp =
+              select(maskElems[elemIdx], i32_val(wordBytes), i32_val(0));
           srcSize = ptxBuilder.newOperand(selectOp, "r");
         }
 
@@ -924,8 +930,13 @@ struct AsyncTMACopyGlobalToLocalOpConversion
         loc, adaptor.getResult(), llvmElemTy, rewriter);
     auto voidTy = void_ty(op->getContext());
     auto id = getThreadId(rewriter, loc);
-    Value pred = icmp_eq(id, i32_val(0));
-    pred = and_(pred, adaptor.getPred());
+
+    auto mod = op->getParentOfType<ModuleOp>();
+    int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(mod);
+    int warpSize = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+    Value warpID = udiv(id, i32_val(warpSize));
+    warpID = LLVM::NVIDIA::shuffleIdx(loc, rewriter, warpID, 0);
+    Value pred = adaptor.getPred();
     // Select just one thread for the TMA copy. This also helps the compiler to
     // figure out that the op is uniform.
     pred = and_(pred, LLVM::NVIDIA::createElectPredicate(loc, rewriter));
@@ -934,16 +945,6 @@ struct AsyncTMACopyGlobalToLocalOpConversion
         op.getResult().getType().getElementType().getIntOrFloatBitWidth() / 8;
     int totalNumElements = product(op.getResult().getType().getShape());
     int64_t size = totalNumElements * elementSizeInBytes;
-    ::mlir::triton::PTXBuilder ptxBuilder;
-    auto &arrive = *ptxBuilder.create<>(
-        "@$0 mbarrier.arrive.expect_tx.shared.b64 _, [$1], " +
-        std::to_string(size) + ";");
-    arrive({ptxBuilder.newOperand(pred, "b"),
-            ptxBuilder.newOperand(barrierMemObj.getBase(), "r")},
-           /*onlyAttachMLIRArgs=*/true);
-    ptxBuilder.launch(rewriter, loc, voidTy);
-
-    barrier();
 
     int innerBlockSize = op.getResult().getType().getShape().back();
     int contigDimSizeInByte = innerBlockSize * elementSizeInBytes;
@@ -957,13 +958,21 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
     // We clamp the block size and the codegen will emit multiple copy
     // operations.
-    for (int copyIdx = 0; copyIdx < numCopies; copyIdx++) {
+    for (int copyIdx = 0; copyIdx < numCopies; copyIdx += numWarps) {
+      int numWarpsToCopy = std::min(numCopies - copyIdx, numWarps);
+      if (numWarpsToCopy == 1)
+        warpID = i32_val(0);
+      Value boxPred =
+          and_(pred, icmp_ult(id, i32_val(numWarpsToCopy * warpSize)));
       ::mlir::triton::PTXBuilder ptxBuilderTMA;
       Type elemPtrTy = ptr_ty(rewriter.getContext(), 3);
-      Value shMemPtr = gep(elemPtrTy, llvmElemTy, dstMemObj.getBase(),
-                           i32_val(copyIdx * (totalNumElements / numCopies)));
+      Value copyIdxVal = add(warpID, i32_val(copyIdx));
+      Value shMemOffset =
+          mul(copyIdxVal, i32_val(totalNumElements / numCopies));
+      Value shMemPtr =
+          gep(elemPtrTy, llvmElemTy, dstMemObj.getBase(), shMemOffset);
       SmallVector<PTXBuilder::Operand *> operands = {
-          ptxBuilderTMA.newOperand(pred, "b"),
+          ptxBuilderTMA.newOperand(boxPred, "b"),
           ptxBuilderTMA.newOperand(shMemPtr, "r"),
           ptxBuilderTMA.newOperand(adaptor.getDescPtr(), "l")};
       std::string tmaInst =
@@ -973,8 +982,8 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       for (int i = 0; i < rank; i++) {
         Value coord = adaptor.getCoord()[rank - i - 1];
         if (i == 0) {
-          int offset = copyIdx * (128 / elementSizeInBytes);
-          coord = add(coord, i32_val(offset));
+          Value offset = mul(copyIdxVal, i32_val(128 / elementSizeInBytes));
+          coord = add(coord, offset);
         }
         operands.push_back(ptxBuilderTMA.newOperand(coord, "r"));
         tmaInst += "$" + std::to_string(operandIdx++);
@@ -1009,15 +1018,19 @@ struct AsyncTMACopyLocalToGlobalOpConversion
         loc, adaptor.getSrc(), llvmElemTy, rewriter);
     auto voidTy = void_ty(op->getContext());
     auto id = getThreadId(rewriter, loc);
-    Value pred = icmp_eq(id, i32_val(0));
     // Select just one thread for the TMA copy. This also helps the compiler to
     // figure out that the op is uniform.
-    pred = and_(pred, LLVM::NVIDIA::createElectPredicate(loc, rewriter));
+    Value pred = LLVM::NVIDIA::createElectPredicate(loc, rewriter);
     int elementSizeInBytes =
         op.getSrc().getType().getElementType().getIntOrFloatBitWidth() / 8;
     int totalNumElements = product(op.getSrc().getType().getShape());
     int64_t size = totalNumElements * elementSizeInBytes;
 
+    auto mod = op->getParentOfType<ModuleOp>();
+    int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(mod);
+    int warpSize = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+    Value warpID = udiv(id, i32_val(warpSize));
+    warpID = LLVM::NVIDIA::shuffleIdx(loc, rewriter, warpID, 0);
     int innerBlockSize = op.getSrc().getType().getShape().back();
     int contigDimSizeInByte = innerBlockSize * elementSizeInBytes;
     int numCopies = 1;
@@ -1030,13 +1043,21 @@ struct AsyncTMACopyLocalToGlobalOpConversion
     // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
     // We clamp the block size and the codegen will emit multiple copy
     // operations.
-    for (int copyIdx = 0; copyIdx < numCopies; copyIdx++) {
+    for (int copyIdx = 0; copyIdx < numCopies; copyIdx += numWarps) {
+      int numWarpsToCopy = std::min(numCopies - copyIdx, numWarps);
+      if (numWarpsToCopy == 1)
+        warpID = i32_val(0);
+      Value boxPred =
+          and_(pred, icmp_ult(id, i32_val(numWarpsToCopy * warpSize)));
       ::mlir::triton::PTXBuilder ptxBuilderTMA;
       Type elemPtrTy = ptr_ty(rewriter.getContext(), 3);
-      Value shMemPtr = gep(elemPtrTy, llvmElemTy, dstMemObj.getBase(),
-                           i32_val(copyIdx * (totalNumElements / numCopies)));
+      Value copyIdxVal = add(warpID, i32_val(copyIdx));
+      Value shMemOffset =
+          mul(copyIdxVal, i32_val(totalNumElements / numCopies));
+      Value shMemPtr =
+          gep(elemPtrTy, llvmElemTy, dstMemObj.getBase(), shMemOffset);
       SmallVector<PTXBuilder::Operand *> operands = {
-          ptxBuilderTMA.newOperand(pred, "b"),
+          ptxBuilderTMA.newOperand(boxPred, "b"),
           ptxBuilderTMA.newOperand(adaptor.getDescPtr(), "l")};
       std::string tmaInst = "@$0 cp.async.bulk.tensor." + std::to_string(rank) +
                             "d.global.shared::cta.bulk_group [$1, {";
@@ -1044,8 +1065,8 @@ struct AsyncTMACopyLocalToGlobalOpConversion
       for (int i = 0; i < rank; i++) {
         Value coord = adaptor.getCoord()[rank - i - 1];
         if (i == 0) {
-          int offset = copyIdx * (128 / elementSizeInBytes);
-          coord = add(coord, i32_val(offset));
+          Value offset = mul(copyIdxVal, i32_val(128 / elementSizeInBytes));
+          coord = add(coord, offset);
         }
         operands.push_back(ptxBuilderTMA.newOperand(coord, "r"));
         tmaInst += "$" + std::to_string(operandIdx++);
@@ -1061,8 +1082,7 @@ struct AsyncTMACopyLocalToGlobalOpConversion
 
     // TODO: Separate the syncronizations operations into separate TTGIR ops to
     // be able to schedule them at the high level.
-    const std::string ptx = "cp.async.bulk.commit_group; \n\t"
-                            "cp.async.bulk.wait_group 0";
+    const std::string ptx = "cp.async.bulk.commit_group";
     PTXBuilder ptxBuilderSync;
     ptxBuilderSync.create<>(ptx)->operator()();
     ptxBuilderSync.launch(rewriter, op.getLoc(), void_ty(op.getContext()));
@@ -1121,6 +1141,27 @@ struct AsyncCommitGroupOpConversion
   }
 };
 
+struct TMAStoreWaitConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::TMAStoreWait> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::TMAStoreWait op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    PTXBuilder ptxBuilder;
+    auto &asyncWaitOp = *ptxBuilder.create<>("cp.async.bulk.wait_group.read");
+    auto num = op.getPendings();
+    asyncWaitOp(ptxBuilder.newConstantOperand(num));
+
+    auto ctx = op.getContext();
+    auto loc = op.getLoc();
+    auto voidTy = void_ty(ctx);
+    ptxBuilder.launch(rewriter, loc, voidTy);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 } // namespace
 
 void mlir::triton::NVIDIA::populateLoadStoreOpToLLVMPatterns(
@@ -1133,5 +1174,6 @@ void mlir::triton::NVIDIA::populateLoadStoreOpToLLVMPatterns(
   patterns.add<AsyncCommitGroupOpConversion>(typeConverter, benefit);
   patterns.add<AsyncWaitOpConversion>(typeConverter, benefit);
   patterns.add<AsyncTMACopyGlobalToLocalOpConversion,
-               AsyncTMACopyLocalToGlobalOpConversion>(typeConverter, benefit);
+               AsyncTMACopyLocalToGlobalOpConversion, TMAStoreWaitConversion>(
+      typeConverter, benefit);
 }

@@ -30,6 +30,7 @@ class HIPOptions:
     kpack: int = 1
     allow_flush_denorm: bool = False
     max_num_imprecise_acc_default: int = 0
+    backend_name: str = 'hip'
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / 'lib'
@@ -37,7 +38,7 @@ class HIPOptions:
         # Ignore user-defined warp size for gfx9
         warp_size = 32 if 'gfx10' in self.arch or 'gfx11' in self.arch else 64
         object.__setattr__(self, 'warp_size', warp_size)
-        libs = ["cuda2gcn", "opencl", "ocml", "ockl"]
+        libs = ["ocml", "ockl"]
         for lib in libs:
             extern_libs[lib] = str(default_libdir / f'{lib}.bc')
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
@@ -62,6 +63,8 @@ class HIPBackend(BaseBackend):
 
     def parse_options(self, opts) -> Any:
         args = {'arch': self.target.arch}
+        if not "enable_fp_fusion" in args:
+            args["enable_fp_fusion"] = os.getenv("TRITON_DEFAULT_FP_FUSION", "1") == "1"
         args.update({k: opts[k] for k in HIPOptions.__dataclass_fields__.keys() if k in opts})
         return HIPOptions(**args)
 
@@ -84,7 +87,13 @@ class HIPBackend(BaseBackend):
 
     @staticmethod
     def path_to_rocm_lld():
-        # First check backend for ld.lld (used for pytorch wheels)
+        # Check env path for ld.lld
+        lld_env_path = os.getenv("TRITON_HIP_LLD_PATH")
+        if lld_env_path is not None:
+            lld = Path(lld_env_path)
+            if lld.is_file():
+                return lld
+        # Check backend for ld.lld (used for pytorch wheels)
         lld = Path(__file__).parent / "llvm/bin/ld.lld"
         if lld.is_file():
             return lld
@@ -94,7 +103,7 @@ class HIPBackend(BaseBackend):
         lld = Path("/usr/bin/ld.lld")
         if lld.is_file():
             return lld
-        raise Exception("ROCm linker /opt/rocm/llvm/bin/ld.lld not found")
+        raise Exception("ROCm linker /opt/rocm/llvm/bin/ld.lld not found. Set 'TRITON_HIP_LLD_PATH' to its path.")
 
     @staticmethod
     def make_ttir(mod, metadata, options):
@@ -154,7 +163,15 @@ class HIPBackend(BaseBackend):
         passes.convert.add_index_to_llvmir(pm)
 
         passes.ttgpuir.add_allocate_shared_memory(pm)
-        amd.passes.ttgpuir.add_to_llvmir(pm, options.arch)
+        ## __HIP_FTZ is used to control the denorm flushing behavior of exp2 op as follows:
+        ## 1. If __HIP_FTZ = 1, exp2 flushes denorms in input and output regardless
+        ##    of the value of kernel arg `allow_flush_denorm`.
+        ## 2. If __HIP_FTZ = 0, whether exp2 flushes denorms in input and output
+        ##    depends on the value of kernel arg `allow_flush_denorm`.
+        ## 3. __HIP_FTZ is default to 1 and not exposed as a kernel argument.
+        ##    For now it is used as a controller for developers only.
+        __HIP_FTZ = True
+        amd.passes.ttgpuir.add_to_llvmir(pm, options.arch, __HIP_FTZ)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
 
@@ -188,23 +205,19 @@ class HIPBackend(BaseBackend):
         amd.set_bool_control_constant(llvm_mod, "__oclc_wavefrontsize64", options.warp_size == 64)
 
         # Set kernel attributes first given this may affect later optimizations.
-        kernels = [fn for fn in llvm_mod.get_functions() if not fn.is_declaration()]
+        fns = [fn for fn in llvm_mod.get_functions() if not fn.is_declaration()]
         # The public kernel should be kernel 0.
-        kernels[0].set_calling_conv(amd.CALLING_CONV_AMDGPU_KERNEL)
-        kernels[0].add_fn_attr("amdgpu-flat-work-group-size", f"1,{options.num_warps*options.warp_size}")
-        kernels[0].add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}")
+        fns[0].set_calling_conv(amd.CALLING_CONV_AMDGPU_KERNEL)
+        fns[0].add_fn_attr("amdgpu-flat-work-group-size", f"1,{options.num_warps*options.warp_size}")
+        fns[0].add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}")
         denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
-        kernels[0].add_fn_attr("denormal-fp-math-f32", denormal_mode)
-        # Hint the compiler that we'd like the firmware to set the kernel arguments
-        # to user SGPRs so that the kernel does not need to s_load its arguments
-        # from memory.
-        amd.set_all_fn_arg_inreg(kernels[0])
+        fns[0].add_fn_attr("denormal-fp-math-f32", denormal_mode)
 
         if options.extern_libs:
             paths = [path for (name, path) in options.extern_libs if amd.need_extern_lib(llvm_mod, name)]
             llvm.link_extern_libs(llvm_mod, paths)
 
-        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3)
+        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, amd.TARGET_TRIPLE)
 
         # Get some metadata
         metadata["shared"] = src.get_int_attr("triton_gpu.shared")

@@ -176,8 +176,8 @@ private:
   void warpReduce(ConversionPatternRewriter &rewriter, Location loc,
                   SmallVector<Value> &acc, triton::ReduceOp op,
                   unsigned numLaneToReduce, unsigned interleave) const {
-    auto success =
-        targetInfo.warpReduce(rewriter, loc, acc, op, numLaneToReduce);
+    auto success = targetInfo.warpReduce(rewriter, loc, acc, op,
+                                         numLaneToReduce, interleave);
     if (success)
       return;
     for (unsigned N = numLaneToReduce / 2; N > 0; N >>= 1) {
@@ -240,7 +240,7 @@ private:
                     ConversionPatternRewriter &rewriter) const {
     auto srcLayout = helper.getSrcLayout();
     auto srcShape = helper.getSrcShape();
-    auto order = getOrder(srcLayout);
+    auto order = triton::gpu::getWarpOrder(srcLayout);
     SmallVector<Value> multiDimWarpId;
 
     // 2x2 warps with slice dim = 0, warpId = 2 ends up writing at the same
@@ -249,7 +249,7 @@ private:
     if (auto sliceLayout = mlir::dyn_cast<SliceEncodingAttr>(srcLayout)) {
       auto parentLayout = sliceLayout.getParent();
       auto parentWarpsPerCTA = triton::gpu::getWarpsPerCTA(parentLayout);
-      auto parentOrder = triton::gpu::getOrder(parentLayout);
+      auto parentOrder = triton::gpu::getWarpOrder(parentLayout);
       multiDimWarpId =
           delinearize(rewriter, loc, warpId, parentWarpsPerCTA, parentOrder);
       multiDimWarpId.erase(multiDimWarpId.begin() + sliceLayout.getDim());
@@ -341,8 +341,8 @@ private:
         auto elemTy = getElementType(op, i);
         Value readPtr = gep(ptr_ty(rewriter.getContext(), 3), elemTy,
                             smemBases[i], readOffset);
-        acc[i] = targetInfo.loadShared(rewriter, loc, getTypeConverter(),
-                                       readPtr, elemTy, threadIsNeeded);
+        acc[i] = targetInfo.loadShared(rewriter, loc, readPtr, elemTy,
+                                       threadIsNeeded);
       }
       warpReduce(rewriter, loc, acc, op, sizeInterWarps, 1 /* interleave */);
       // only the first thread in each sizeInterWarps is writing

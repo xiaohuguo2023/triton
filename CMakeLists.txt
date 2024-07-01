@@ -34,6 +34,8 @@ set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
 # Customized release build type with assertions: TritonRelBuildWithAsserts
 set(CMAKE_C_FLAGS_TRITONRELBUILDWITHASSERTS "-O2 -g")
 set(CMAKE_CXX_FLAGS_TRITONRELBUILDWITHASSERTS "-O2 -g")
+set(CMAKE_C_FLAGS_TRITONBUILDWITHO1 "-O1")
+set(CMAKE_CXX_FLAGS_TRITONBUILDWITHO1 "-O1")
 
 # Default build type
 if(NOT CMAKE_BUILD_TYPE)
@@ -219,11 +221,18 @@ if(TRITON_BUILD_PYTHON_MODULE)
           LLVMAArch64CodeGen
           LLVMAArch64AsmParser
       )
-  else()
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
       list(APPEND TRITON_LIBRARIES
           LLVMX86CodeGen
           LLVMX86AsmParser
       )
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le")
+      list(APPEND TRITON_LIBRARIES
+        LLVMPowerPCAsmParser
+        LLVMPowerPCCodeGen
+      )
+  else()
+    message(FATAL_ERROR "LLVM codegen/ASM parser libs: This HW architecture (${CMAKE_SYSTEM_PROCESSOR}) is not configured in cmake lib dependencies.")
   endif()
 
   # Define triton library
@@ -253,12 +262,16 @@ if(TRITON_BUILD_PYTHON_MODULE)
   target_link_options(triton PRIVATE ${LLVM_LDFLAGS})
 endif()
 
+if (UNIX AND NOT APPLE)
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--exclude-libs,ALL")
+endif()
+
 if(TRITON_BUILD_PYTHON_MODULE AND NOT WIN32)
   set(CMAKE_SHARED_LIBRARY_SUFFIX ".so")
 
   # Check if the platform is MacOS
   if(APPLE)
-    set(PYTHON_LDFLAGS "-undefined dynamic_lookup -flto")
+    set(PYTHON_LDFLAGS "-undefined dynamic_lookup")
   endif()
 
   target_link_libraries(triton PRIVATE ${PYTHON_LDFLAGS})

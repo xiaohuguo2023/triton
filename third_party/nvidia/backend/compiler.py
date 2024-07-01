@@ -1,10 +1,9 @@
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton._C.libtriton import ir, passes, llvm, nvidia
-from triton.backends.nvidia.driver import CudaUtils
 
 from dataclasses import dataclass
 import functools
-from typing import Any, Tuple
+from typing import Any, Tuple, Optional
 import hashlib
 import re
 import tempfile
@@ -64,6 +63,9 @@ class CUDAOptions:
     num_warps: int = 4
     num_ctas: int = 1
     num_stages: int = 3
+    # maxnreg corresponds to the ptx parameter .maxnreg, which controls the
+    # maximum number of 32-bit registers used by one thread.
+    maxnreg: Optional[int] = None
     cluster_dims: tuple = (1, 1, 1)
     ptx_version: int = None
     enable_fp_fusion: bool = True
@@ -74,6 +76,7 @@ class CUDAOptions:
     max_num_imprecise_acc_default: bool = None
     extern_libs: dict = None
     debug: bool = False
+    backend_name: str = 'cuda'
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / 'lib'
@@ -107,6 +110,8 @@ class CUDABackend(BaseBackend):
         args = {k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts}
         args["allow_fp8e4nv"] = self.capability >= 89
         args["allow_fp8e4b15"] = self.capability < 90
+        if not "enable_fp_fusion" in args:
+            args["enable_fp_fusion"] = os.getenv("TRITON_DEFAULT_FP_FUSION", "1") == "1"
         args["max_num_imprecise_acc_default"] = 2**30 if self.capability == 90 else 0
         return CUDAOptions(**args)
 
@@ -153,6 +158,11 @@ class CUDABackend(BaseBackend):
             cluster_info.clusterDimX = opt.cluster_dims[0]
             cluster_info.clusterDimY = opt.cluster_dims[1]
             cluster_info.clusterDimZ = opt.cluster_dims[2]
+        # Set up Diagnostic
+        if os.environ.get("MLIR_ENABLE_REMARK", "0") == "1":
+            srcMgr = llvm.source_mgr()
+            diag = ir.source_mgr_diag(srcMgr, mod.context)
+            mod.context.printOpOnDiagnostic(True)
         # TTIR -> TTGIR
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
@@ -165,14 +175,14 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_plan_cta(pm, cluster_info)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
-        passes.ttgpuir.add_accelerate_matmul(pm, capability)
+        passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.common.add_cse(pm)
         if capability // 10 >= 8:
-            passes.ttgpuir.add_pipeline(pm, opt.num_stages, opt.num_warps, opt.num_ctas, capability)
-        if capability // 10 <= 8:
-            passes.ttgpuir.add_prefetch(pm)
+            passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            passes.ttgpuir.add_pipeline(pm, opt.num_stages)
+        passes.ttgpuir.add_prefetch(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
@@ -198,6 +208,7 @@ class CUDABackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         nvidia.passes.ttgpuir.add_decompose_unsupported_conversions(pm)
+        passes.ttgpuir.add_combine_tensor_select_and_if(pm)
         passes.convert.add_scf_to_cf(pm)
         passes.convert.add_index_to_llvmir(pm)
         passes.ttgpuir.add_allocate_shared_memory(pm)
@@ -215,15 +226,18 @@ class CUDABackend(BaseBackend):
         context = llvm.context()
         llvm_mod = llvm.to_module(mod, context)
         nvidia.set_nvvm_reflect_ftz(llvm_mod)
+
+        # Set maxnreg on all kernels, if it was provided.
+        if options.maxnreg is not None:
+            for k in llvm_mod.get_functions():
+                if not k.is_declaration() and k.is_external_linkage():
+                    k.set_nvvm_maxnreg(options.maxnreg)
+
         if options.extern_libs:
             paths = [path for (name, path) in options.extern_libs]
             llvm.link_extern_libs(llvm_mod, paths)
+
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3)
-        # Set kernel attributes
-        # kernels = [fn for fn in llvm_mod.get_functions() if fn.has_public_visibility() and not fn.is_declaration()]
-        # assert len(kernels) == 1
-        # kernels[0].add_fn_attr("nvvm.maxntid", f"1, {options.num_warps*32}")
-        # kernels[0].add_fn_attr("nvvm.kernel", "1")
 
         # Get some metadata
         metadata["shared"] = src.get_int_attr("triton_gpu.shared")
@@ -234,18 +248,27 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def make_ptx(src, metadata, opt, capability):
+        ptx_version = opt.ptx_version
+        if ptx_version is None:
+            _, cuda_version = _path_to_binary("ptxas")
+            ptx_version = ptx_get_version(cuda_version)
+
+        # PTX 8.3 is the max version supported by llvm 3a83162168.
+        #
+        # To check if a newer PTX version is supported, increase this value
+        # and run a test.  If it's not supported, LLVM will print a warning
+        # like "+ptx8.4 is not a recognized feature for this target".
+        llvm_ptx_version = min(83, ptx_version)
+
+        triple = 'nvptx64-nvidia-cuda'
         proc = 'sm_90a' if capability == 90 else f'sm_{capability}'
-        ret = llvm.translate_to_asm(src, 'nvptx64-nvidia-cuda', proc, '', ['nvptx-short-ptr'], opt.enable_fp_fusion,
-                                    False)
+        features = f'+ptx{llvm_ptx_version}'
+        ret = llvm.translate_to_asm(src, triple, proc, features, ['nvptx-short-ptr'], opt.enable_fp_fusion, False)
         # Find kernel names (there should only be one)
         names = re.findall(r".visible .entry ([a-zA-Z_][a-zA-Z0-9_]*)", ret)
         assert len(names) == 1
         metadata["name"] = names[0]
         # post-process
-        ptx_version = opt.ptx_version
-        if ptx_version is None:
-            _, cuda_version = _path_to_binary("ptxas")
-            ptx_version = ptx_get_version(cuda_version)
         ptx_version = f'{ptx_version//10}.{ptx_version%10}'
         ret = re.sub(r'\.version \d+\.\d+', f'.version {ptx_version}', ret, flags=re.MULTILINE)
         # Remove the debug flag that prevents ptxas from optimizing the code

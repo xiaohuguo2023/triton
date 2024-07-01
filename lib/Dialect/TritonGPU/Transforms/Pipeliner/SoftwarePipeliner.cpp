@@ -1,6 +1,3 @@
-#include "PipelineExpander.h"
-#include "PipeliningUtility.h"
-#include "Schedule.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/TypeUtilities.h"
@@ -11,6 +8,9 @@
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipelineExpander.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
@@ -26,9 +26,11 @@
 // expander to generate the prologue and new loop.
 //===----------------------------------------------------------------------===//
 
-using namespace mlir;
+namespace mlir {
+namespace triton {
+namespace gpu {
 
-#define GEN_PASS_CLASSES
+#define GEN_PASS_DEF_TRITONGPUPIPELINE
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
 // Return true if the preconditions for pipelining the loop are met.
@@ -91,16 +93,9 @@ static bool pipelineLoop(scf::ForOp forOp, int numStages) {
   return true;
 }
 
-namespace {
-struct PipelinePass : public TritonGPUPipelineBase<PipelinePass> {
-  PipelinePass() = default;
-  PipelinePass(int numStages, int numWarps, int numCTAs,
-               int computeCapability) {
-    this->numStages = numStages;
-    this->numWarps = numWarps;
-    this->numCTAs = numCTAs;
-    this->computeCapability = computeCapability;
-  }
+struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
+
+  using impl::TritonGPUPipelineBase<PipelinePass>::TritonGPUPipelineBase;
 
   int getNumStagesOrDefault(scf::ForOp forOp) {
     // Use the attribute attached to the loop if it exists otherwise use the
@@ -128,7 +123,7 @@ struct PipelinePass : public TritonGPUPipelineBase<PipelinePass> {
       auto outerLoop = dyn_cast<scf::ForOp>(forOp->getParentOp());
       int loopNumStages = getNumStagesOrDefault(forOp);
       bool pipelined = pipelineLoop(forOp, loopNumStages);
-      if (pipelined && outerLoop)
+      if (pipelined && outerLoop && getNumStagesOrDefault(outerLoop) > 1)
         outerLoops.insert(outerLoop);
     }
 
@@ -149,13 +144,21 @@ struct PipelinePass : public TritonGPUPipelineBase<PipelinePass> {
     // the inner loop.
     for (scf::ForOp outerLoop : outerLoops)
       tryAndPipelineOuterLoop(outerLoop);
+
+    // Re-collect loop ops
+    loops.clear();
+    getOperation()->walk([&](scf::ForOp forOp) {
+      // Bail out for loops with num_stage <= 1.
+      if (getNumStagesOrDefault(forOp) > 1)
+        loops.push_back(forOp);
+    });
+
+    for (scf::ForOp forOp : loops) {
+      mlir::triton::pipelineTMAStores(forOp);
+    }
   }
 };
-} // anonymous namespace
 
-std::unique_ptr<Pass>
-mlir::triton::gpu::createPipelinePass(int numStages, int numWarps, int numCTAs,
-                                      int computeCapability) {
-  return std::make_unique<PipelinePass>(numStages, numWarps, numCTAs,
-                                        computeCapability);
-}
+} // namespace gpu
+} // namespace triton
+} // namespace mlir

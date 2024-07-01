@@ -27,7 +27,7 @@ createOptimizeLDSUsagePass(StringRef arch, int32_t customLDSLimit = 0);
 } // namespace AMD
 
 std::unique_ptr<OperationPass<ModuleOp>>
-createConvertTritonAMDGPUToLLVMPass(StringRef targetArch);
+createConvertTritonAMDGPUToLLVMPass(StringRef targetArch, bool ftz);
 std::unique_ptr<OperationPass<ModuleOp>> createConvertBuiltinFuncToLLVMPass();
 
 #define GEN_PASS_REGISTRATION

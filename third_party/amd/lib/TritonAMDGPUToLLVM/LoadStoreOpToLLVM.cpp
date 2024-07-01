@@ -114,8 +114,8 @@ struct LoadStoreConversionBase {
   }
 
 protected:
-  ModuleAxisInfoAnalysis &axisAnalysisPass;
   const AMD::TargetInfo &targetInfo;
+  ModuleAxisInfoAnalysis &axisAnalysisPass;
 };
 
 struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
@@ -618,6 +618,10 @@ struct AtomicRMWOpConversion
         auto tmp = insert_element(vecTy, undef(vecTy), atom, i32_val(0));
         atom = insert_element(vecTy, tmp, atom2, i32_val(1)).getResult();
       }
+      if (!tensorTy) {
+        Value atomPtr = getSharedMemoryBase(loc, rewriter, op.getOperation());
+        store(atom, atomPtr);
+      }
       rewriter.create<LLVM::BrOp>(loc, atom, endBlock);
 
       rewriter.setInsertionPointToStart(endBlock);
@@ -630,7 +634,6 @@ struct AtomicRMWOpConversion
         }
       } else {
         Value atomPtr = getSharedMemoryBase(loc, rewriter, op.getOperation());
-        store(retVal, atomPtr);
         barrier();
         Value ret = load(valueElemTy, atomPtr);
         barrier();

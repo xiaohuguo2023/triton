@@ -67,13 +67,14 @@ def TTNG_ClusterWaitOp : TTNG_Op<"cluster_wait", []> {
 }
 
 //
-// DotAsync Op
+// WarpGroupDot Op
 //
-def TTNG_DotAsyncOp : TTNG_Op<"dot_async", [Pure,
-                             DeclareOpInterfaceMethods<InferTypeOpInterface>,
-                             TypesMatchWith<"result's type matches accumulator's type",
-                                            "d", "c", "$_self">]> {
-    let summary = "dot async";
+def TTNG_WarpGroupDotOp : TTNG_Op<"warp_group_dot", [DeclareOpInterfaceMethods<InferTypeOpInterface>,
+                                            DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+                                            DotLike,
+                                            TypesMatchWith<"result's type matches accumulator's type",
+                                                            "d", "c", "$_self">]> {
+    let summary = "warp group dot";
 
     let description = [{
         $d = matrix_multiply($a, $b) + $c. For docs on InputPrecisionAttr, see TT_DotOp
@@ -82,17 +83,18 @@ def TTNG_DotAsyncOp : TTNG_Op<"dot_async", [Pure,
     let arguments = (ins TT_TensorOrMemDesc:$a,
                          TT_TensorOrMemDesc:$b,
                          TT_FpIntTensor:$c,
-                         TT_InputPrecisionAttr:$inputPrecision,
-                         I32Attr:$maxNumImpreciseAcc);
+                         DefaultValuedAttr<TT_InputPrecisionAttr, "::mlir::triton::InputPrecision::IEEE">:$inputPrecision,
+                         DefaultValuedAttr<I32Attr, "0">:$maxNumImpreciseAcc,
+                         DefaultValuedAttr<BoolAttr, "false">:$isAsync);
 
     let results = (outs TT_FpIntTensor:$d);
 
     let assemblyFormat = "$a`,` $b`,` $c attr-dict `:` type($a) `*` type($b) `->` type($d)";
 }
 
-def TTNG_DotWaitOp : TTNG_Op<"dot_wait", [DeclareOpInterfaceMethods<InferTypeOpInterface>,
-                                          AllTypesMatch<["inputs", "outputs"]>]> {
-  let summary = "dot wait";
+def TTNG_WarpGroupDotWaitOp : TTNG_Op<"warp_group_dot_wait", [DeclareOpInterfaceMethods<InferTypeOpInterface>,
+                                                     AllTypesMatch<["inputs", "outputs"]>]> {
+  let summary = "warp group dot wait";
   let arguments = (ins Variadic<TT_TensorOrMemDesc>:$inputs, I32Attr:$pendings);
   let results = (outs Variadic<TT_TensorOrMemDesc>:$outputs);
   let description = [{
@@ -100,13 +102,13 @@ def TTNG_DotWaitOp : TTNG_Op<"dot_wait", [DeclareOpInterfaceMethods<InferTypeOpI
 
     $inputs must be the tensors corresponding to the async dot ops that we're
     waiting on.  For example, if there are N pending async dot ops and we call
-    `dot_wait 1`, then $inputs must be the result of the first dot op.
+    `warp_group_dot_wait 1`, then $inputs must be the result of the first dot op.
   }];
 
   let assemblyFormat = "$inputs attr-dict `:` type($inputs)";
 }
 
-def TTNG_InitBarrierOp : TTNG_Op<"init_barrier", [MemoryEffects<[MemWrite<SharedMemory>]>]> {
+def TTNG_InitBarrierOp : TTNG_Op<"init_barrier", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
     let summary = "Initialize a barrier in the given shared memory allocation.";
 
     let description = [{
@@ -123,7 +125,7 @@ def TTNG_InitBarrierOp : TTNG_Op<"init_barrier", [MemoryEffects<[MemWrite<Shared
     let assemblyFormat = "$alloc `,` $count attr-dict `:` type($alloc)";
 }
 
-def TTNG_InvalBarrierOp : TTNG_Op<"inval_barrier", [MemoryEffects<[MemWrite<SharedMemory>]>]> {
+def TTNG_InvalBarrierOp : TTNG_Op<"inval_barrier", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
     let summary = "Invalidate a barrier allocation.";
 
     let description = [{
@@ -138,8 +140,27 @@ def TTNG_InvalBarrierOp : TTNG_Op<"inval_barrier", [MemoryEffects<[MemWrite<Shar
     let assemblyFormat = "$alloc attr-dict `:` type($alloc)";
 }
 
+def TTNG_BarrierExpectOp : TTNG_Op<"barrier_expect", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Signal a barrier of an expected number of bytes to be copied.";
 
-def TTNG_WaitBarrierOp : TTNG_Op<"wait_barrier", []> {
+  let description = [{
+    This signal the barrier that `size` bytes are expected to be copied. The
+    associated barrier wait will block until the expected number of bytes are copied.
+  }];
+
+  let hasVerifier = 1;
+  let arguments = (
+    ins TT_MemDescType:$alloc,
+    I32Attr:$size,
+    I1:$pred
+  );
+
+  let assemblyFormat = [{
+    $alloc `,` $size attr-dict `,` $pred `:` type($alloc)
+  }];
+}
+
+def TTNG_WaitBarrierOp : TTNG_Op<"wait_barrier", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
     let summary = "wait until the mbarrier phase completes.";
 
     let description = [{
@@ -160,8 +181,7 @@ def TTNG_WaitBarrierOp : TTNG_Op<"wait_barrier", []> {
 }
 
 
-def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local", [
-  MemoryEffects<[MemRead<GlobalMemory>, MemWrite<SharedMemory>]>]> {
+def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "copy data based on descriptor from global memory to local memory asynchronously";
 
   let description = [{
@@ -191,8 +211,7 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local",
   }];
 }
 
-def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global", [
-  MemoryEffects<[MemRead<SharedMemory>, MemWrite<GlobalMemory>]>]> {
+def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "copy data based on descriptor from local memory to global memory asynchronously";
 
   let description = [{
@@ -213,5 +232,17 @@ def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global",
     attr-dict `:` type($desc_ptr) `,` type($src)
   }];
 }
+
+def TTNG_TMAStoreWait : TTNG_Op<"async_tma_store_wait"> {
+  let summary = "wait until all the inputs are read.";
+  let arguments = (ins I32Attr:$pendings);
+  let description = [{
+    Wait until all the read operations are done from the associated store operations.
+    This is needed before the shared memory can be written to.
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
 
 #endif

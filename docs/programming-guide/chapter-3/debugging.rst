@@ -5,7 +5,7 @@ Debugging Triton
 This tutorial provides guidance for debugging Triton programs.
 It is mostly documented for Triton users.
 Developers interested in exploring Triton's backend, including MLIR code transformation and LLVM code generation,
-can refer to this `section <https://github.com/openai/triton?tab=readme-ov-file#tips-for-hacking>`_ to explore debugging options.
+can refer to this `section <https://github.com/triton-lang/triton?tab=readme-ov-file#tips-for-hacking>`_ to explore debugging options.
 
 ------------------------------------
 Using Triton's Debugging Operations
@@ -69,8 +69,6 @@ The interpreter has several known limitations:
 
     ptr = tl.load(ptr)
     x = tl.load(ptr)
-
-- Unlike the compilation mode, a scalar in interpreter mode is treated as a simple float or integer but not as a 0-d tensor. This means it lacks tensor attributes such as :code:`x.dtype`. A workaround is to explicitly convert the scalar to a tensor using :code:`tl.to_tensor(x)`, where :code:`x` is the scalar.
 
 ----------------------------
 Using Third-party Tools

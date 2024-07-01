@@ -99,6 +99,8 @@ def get_build_type():
         return "RelWithDebInfo"
     elif check_env_flag("TRITON_REL_BUILD_WITH_ASSERTS"):
         return "TritonRelBuildWithAsserts"
+    elif check_env_flag("TRITON_BUILD_WITH_O1"):
+        return "TritonBuildWithO1"
     else:
         # TODO: change to release when stable enough
         return "TritonRelBuildWithAsserts"
@@ -142,13 +144,16 @@ def get_json_package_info():
 # llvm
 def get_llvm_package_info():
     system = platform.system()
-    arch = {"x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}[platform.machine()]
+    try:
+        arch = {"x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}[platform.machine()]
+    except KeyError:
+        arch = platform.machine()
     if system == "Darwin":
         system_suffix = f"macos-{arch}"
     elif system == "Linux":
         if arch == 'arm64':
             system_suffix = 'ubuntu-arm64'
-        else:
+        elif arch == 'x64':
             vglibc = tuple(map(int, platform.libc_ver()[1].split('.')))
             vglibc = vglibc[0] * 100 + vglibc[1]
             if vglibc > 228:
@@ -164,7 +169,15 @@ def get_llvm_package_info():
                 # Manylinux_2014 (v2.17)
                 # CentOS 7 (v2.17)
                 system_suffix = "centos-x64"
+        else:
+            print(
+                f"LLVM pre-compiled image is not available for {system}-{arch}. Proceeding with user-configured LLVM from source build."
+            )
+            return Package("llvm", "LLVM-C.lib", "", "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
     else:
+        print(
+            f"LLVM pre-compiled image is not available for {system}-{arch}. Proceeding with user-configured LLVM from source build."
+        )
         return Package("llvm", "LLVM-C.lib", "", "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
     # use_assert_enabled_llvm = check_env_flag("TRITON_USE_ASSERT_ENABLED_LLVM", "False")
     # release_suffix = "assert" if use_assert_enabled_llvm else "release"
@@ -172,7 +185,7 @@ def get_llvm_package_info():
     with open(llvm_hash_path, "r") as llvm_hash_file:
         rev = llvm_hash_file.read(8)
     name = f"llvm-{rev}-{system_suffix}"
-    url = f"https://tritonlang.blob.core.windows.net/llvm-builds/{name}.tar.gz"
+    url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
     return Package("llvm", name, url, "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
 
 
@@ -190,7 +203,9 @@ def open_url(url):
 
 
 def get_triton_cache_path():
-    user_home = os.getenv("HOME") or os.getenv("USERPROFILE") or os.getenv("HOMEPATH") or None
+    user_home = os.getenv("TRITON_HOME")
+    if not user_home:
+        user_home = os.getenv("HOME") or os.getenv("USERPROFILE") or os.getenv("HOMEPATH") or None
     if not user_home:
         raise RuntimeError("Could not find user home directory")
     return os.path.join(user_home, ".triton")
@@ -235,7 +250,10 @@ def download_and_copy(name, src_path, variable, version, url_func):
         return
     base_dir = os.path.dirname(__file__)
     system = platform.system()
-    arch = {"x86_64": "64", "arm64": "aarch64", "aarch64": "aarch64"}[platform.machine()]
+    try:
+        arch = {"x86_64": "64", "arm64": "aarch64", "aarch64": "aarch64"}[platform.machine()]
+    except KeyError:
+        arch = platform.machine()
     url = url_func(arch, version)
     tmp_path = os.path.join(triton_cache_path, "nvidia", name)  # path to cache the download
     dst_path = os.path.join(base_dir, os.pardir, "third_party", "nvidia", "backend", src_path)  # final binary path
@@ -328,6 +346,10 @@ class CMakeBuild(build_ext):
         if cupti_include_dir == "":
             cupti_include_dir = os.path.join(get_base_dir(), "third_party", "nvidia", "backend", "include")
         cmake_args += ["-DCUPTI_INCLUDE_DIR=" + cupti_include_dir]
+        roctracer_include_dir = get_env_with_keys(["ROCTRACER_INCLUDE_PATH"])
+        if roctracer_include_dir == "":
+            roctracer_include_dir = os.path.join(get_base_dir(), "third_party", "amd", "backend", "include")
+        cmake_args += ["-DROCTRACER_INCLUDE_DIR=" + roctracer_include_dir]
         return cmake_args
 
     def build_extension(self, ext):
@@ -398,7 +420,10 @@ class CMakeBuild(build_ext):
                 "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
             ]
 
-        cmake_args += self.get_proton_cmake_args()
+        if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
+            cmake_args += self.get_proton_cmake_args()
+        else:
+            cmake_args += ["-DTRITON_BUILD_PROTON=OFF"]
 
         env = os.environ.copy()
         cmake_dir = get_cmake_dir()
@@ -484,7 +509,8 @@ def add_link_to_proton():
 
 def add_links():
     add_link_to_backends()
-    add_link_to_proton()
+    if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
+        add_link_to_proton()
 
 
 class plugin_install(install):
@@ -530,8 +556,7 @@ def get_packages():
         "triton/language",
         "triton/language/extra",
         "triton/language/extra/cuda",
-        "triton/ops",
-        "triton/ops/blocksparse",
+        "triton/language/extra/hip",
         "triton/runtime",
         "triton/backends",
         "triton/tools",
@@ -542,14 +567,17 @@ def get_packages():
 
 
 def get_entry_points():
-    entry_points = {
-        "console_scripts": ["proton-viewer = triton.profiler.viewer:main", "proton = triton.profiler.proton:main"]
-    }
+    entry_points = {}
+    if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
+        entry_points["console_scripts"] = [
+            "proton-viewer = triton.profiler.viewer:main",
+            "proton = triton.profiler.proton:main",
+        ]
     return entry_points
 
 
 def get_install_requires():
-    install_requires = ["filelock", "llnl-hatchet"]
+    install_requires = ["filelock"]
     return install_requires
 
 
@@ -578,7 +606,7 @@ setup(
     zip_safe=False,
     # for PyPI
     keywords=["Compiler", "Deep Learning"],
-    url="https://github.com/openai/triton/",
+    url="https://github.com/triton-lang/triton/",
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
@@ -603,6 +631,7 @@ setup(
             "numpy",
             "pytest",
             "scipy>=1.7.1",
+            "llnl-hatchet",
         ],
         "tutorials": [
             "matplotlib",

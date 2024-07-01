@@ -80,9 +80,12 @@ def computation_type_impl(a_ty: tl.dtype, b_ty: tl.dtype, div_or_mod: bool) -> t
         if a_ty.is_bf16() and b_ty.is_bf16():
             return tl.bfloat16
         return tl.float32
+    # 5) return fp16 if operands are different fp8
+    if a_ty.is_fp8() and b_ty.is_fp8():
+        return a_ty if a_ty == b_ty else tl.float16
     if not a_ty.is_int() or not b_ty.is_int():
         raise TypeError(f"unexpected type {a_ty} and {b_ty}")
-    # 5 ) both operands are integer and undergo
+    # 6 ) both operands are integer and undergo
     #    integer promotion
     if div_or_mod and a_ty.int_signedness != b_ty.int_signedness:
         raise TypeError("Cannot use /, #, or % with " + a_ty.__repr__() + " and " + b_ty.__repr__() +
@@ -944,7 +947,7 @@ def _canonicalize_boundary_check(boundary_check, block_shape):
 def _load_block_pointer(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile, builder):
     # Load by a block pointer: `pointer_type<block_type<>>`
     # Block pointer can not have `mask` and `other` arguments
-    if mask or other:
+    if mask is not None or other is not None:
         raise ValueError("`mask` and `other` arguments cannot be specified for loading block pointers")
 
     elt_ty = ptr.type.element_ty.element_ty
@@ -969,7 +972,7 @@ def _load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_
         raise ValueError(f"Unsupported ptr type {ptr.type.__repr__()} in `tl.load`")
 
     # Check `mask`, `other`, `boundary_check`, and `padding` arguments
-    if not mask and other:
+    if mask is None and other is not None:
         raise ValueError("`other` cannot be provided without `mask`")
     if padding or boundary_check:
         raise ValueError("`padding_option` or `boundary_check` argument is not supported for loading a tensor of"
@@ -1013,7 +1016,7 @@ def _load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_
         dst_ty = elt_ty
 
     # Build IR
-    if not mask:
+    if mask is None:
         return tl.tensor(builder.create_load(ptr.handle, cache, eviction, is_volatile), dst_ty)
     else:
         return tl.tensor(
@@ -1418,7 +1421,6 @@ def where(condition: tl.tensor, x: tl.tensor, y: tl.tensor, builder: ir.builder)
         condition, x = broadcast_impl_value(condition, x, builder)
         x, y = broadcast_impl_value(x, y, builder)
         condition, x = broadcast_impl_value(condition, x, builder)
-
     x, y = binary_op_type_checking_impl(x, y, builder, True, True)
     if not condition.type.is_block():
         condition, _ = broadcast_impl_value(condition, x, builder)

@@ -1,4 +1,4 @@
-#include <pybind11/functional.h>
+﻿#include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -10,6 +10,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
@@ -19,12 +20,15 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
+#include "mlir/Transforms/LocationSnapshot.h"
 #include "mlir/Transforms/Passes.h"
+
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
+#include "llvm/Support/SourceMgr.h"
 
 namespace {
 
@@ -199,7 +203,16 @@ void init_triton_ir(py::module &&m) {
       .value("IEEE", InputPrecision::IEEE)
       .export_values();
 
-  py::class_<MLIRContext>(m, "context", py::module_local()).def(py::init<>());
+  py::class_<MLIRContext>(m, "context", py::module_local())
+      .def(py::init<>())
+      .def("printOpOnDiagnostic",
+           [](MLIRContext &self, bool v) { self.printOpOnDiagnostic(v); })
+      .def("printStackTraceOnDiagnostic", [](MLIRContext &self, bool v) {
+        self.printStackTraceOnDiagnostic(v);
+      });
+  py::class_<SourceMgrDiagnosticHandler>(m, "source_mgr_diag",
+                                         py::module_local())
+      .def(py::init<llvm::SourceMgr &, MLIRContext *>());
 
   m.def("load_dialects", [](MLIRContext &context) {
     DialectRegistry registry;
@@ -380,9 +393,7 @@ void init_triton_ir(py::module &&m) {
              std::string str;
              llvm::raw_string_ostream os(str);
              auto printingFlags = OpPrintingFlags();
-             bool dumpLoc = !::triton::tools::getBoolEnv("USE_TTGIR_LOC");
-             if (dumpLoc)
-               printingFlags.enableDebugInfo();
+             printingFlags.enableDebugInfo();
              self->print(os, printingFlags);
              return str;
            })
@@ -447,9 +458,7 @@ void init_triton_ir(py::module &&m) {
              std::string str;
              llvm::raw_string_ostream os(str);
              auto printingFlags = OpPrintingFlags();
-             bool dumpLoc = !::triton::tools::getBoolEnv("USE_TTGIR_LOC");
-             if (dumpLoc)
-               printingFlags.enableDebugInfo();
+             printingFlags.enableDebugInfo();
              self.print(os, printingFlags);
              return str;
            })
@@ -474,6 +483,12 @@ void init_triton_ir(py::module &&m) {
                return py::none();
              return py::int_(ret.getInt());
            })
+      .def("create_location_snapshot",
+           [](ModuleOp &self, const std::string &fileName) -> void {
+             generateLocationsFromIR(/*raw_ostream=*/llvm::nulls(),
+                                     /*fileName=*/fileName,
+                                     /*op=*/self, /*flags=*/{});
+           })
       .def("walk",
            [](ModuleOp &self, const std::function<void(Operation *)> &fn) {
              self.walk(fn);
@@ -494,12 +509,6 @@ void init_triton_ir(py::module &&m) {
             parseSourceFile<ModuleOp>(inputFilename, &context);
         if (!module)
           throw std::runtime_error("Parse MLIR file failed.");
-        // locations are incompatible with ptx < 7.5 !
-        if (!::triton::tools::getBoolEnv("USE_TTGIR_LOC"))
-          module->walk([](Operation *op) {
-            op->setLoc(UnknownLoc::get(op->getContext()));
-          });
-
         return module->clone();
       },
       ret::take_ownership);
@@ -521,6 +530,9 @@ void init_triton_ir(py::module &&m) {
       .def(
           "set_arg_attr",
           [](FuncOp &self, int arg_no, const std::string &name, int val) {
+            if (arg_no >= self.getNumArguments())
+              throw pybind11::index_error(
+                  "Function argument index out of range");
             // set arg attributes "name" to value "val"
             auto attrTy = IntegerType::get(self.getContext(), 32);
             self.setArgAttr(arg_no, name, IntegerAttr::get(attrTy, val));
@@ -1557,6 +1569,12 @@ void init_triton_ir(py::module &&m) {
              bool haveDiagnostics =
                  ::triton::tools::getBoolEnv("MLIR_ENABLE_DIAGNOSTICS");
              bool haveDump = ::triton::tools::getBoolEnv("MLIR_ENABLE_DUMP");
+             std::string funcToDump;
+             if (!haveDump) {
+               funcToDump = triton::tools::getStrEnv("MLIR_ENABLE_DUMP");
+               if (!funcToDump.empty())
+                 haveDump = true;
+             }
              if (haveDiagnostics || haveDump) {
                context->disableMultithreading();
              }
@@ -1572,7 +1590,19 @@ void init_triton_ir(py::module &&m) {
                auto printingFlags = OpPrintingFlags();
                printingFlags.elideLargeElementsAttrs(16);
                printingFlags.enableDebugInfo();
-               auto printAlways = [](Pass *, Operation *) { return true; };
+               auto printAlways = [funcToDump](Pass *, Operation *op) -> bool {
+                 if (funcToDump.empty())
+                   return true;
+                 if (auto mod = dyn_cast<mlir::ModuleOp>(op)) {
+                   return mod.lookupSymbol(funcToDump);
+                 }
+                 if (auto func = dyn_cast<triton::FuncOp>(op)) {
+                   return SymbolTable::getSymbolName(func).getValue() ==
+                          funcToDump;
+                 }
+
+                 return false;
+               };
                self.enableIRPrinting(
                    /*shouldPrintBeforePass=*/printAlways,
                    /*shouldPrintAfterPass=*/printAlways,
@@ -1585,6 +1615,7 @@ void init_triton_ir(py::module &&m) {
       .def("run", [](PassManager &self, ModuleOp &mod) {
         // TODO: maybe dump module to file and print error for better
         // diagnostics
+
         auto reproducerPath =
             triton::tools::getStrEnv("TRITON_REPRODUCER_PATH");
         if (!reproducerPath.empty()) {
@@ -1618,17 +1649,30 @@ void init_triton_ir(py::module &&m) {
           ::llvm::setCurrentDebugTypes(debugTypes.data(), debugTypes.size());
         }
 
+        bool haveTiming = ::triton::tools::getBoolEnv("MLIR_ENABLE_TIMING");
+        if (haveTiming) {
+          self.enableTiming();
+        }
+
         if (failed(self.run(mod.getOperation())))
           throw std::runtime_error("PassManager::run failed");
       });
 }
 
 void init_triton_env_vars(py::module &m) {
-  m.def("get_cache_invalidating_env_vars", []() -> std::map<std::string, bool> {
-    std::map<std::string, bool> ret;
-    for (const auto &envVar : CACHE_INVALIDATING_ENV_VARS) {
-      ret[envVar] = triton::tools::getBoolEnv(envVar);
-    }
-    return ret;
-  });
+  m.def("get_cache_invalidating_env_vars",
+        []() -> std::map<std::string, std::string> {
+          std::map<std::string, std::string> ret;
+          for (const auto &envVar : CACHE_INVALIDATING_ENV_VARS) {
+            auto strVal = triton::tools::getStrEnv(envVar);
+            if (strVal.empty())
+              continue;
+            auto boolV = triton::tools::isEnvValueBool(strVal);
+            if (boolV.has_value())
+              ret[envVar] = boolV.value() ? "true" : "false";
+            else
+              ret[envVar] = strVal;
+          }
+          return ret;
+        });
 }

@@ -74,7 +74,7 @@ def TTG_AsyncCommitGroupOp : TTG_Op<"async_commit_group"> {
 
 def TTG_AsyncCopyGlobalToLocalOp : TTG_Op<"async_copy_global_to_local", [
   AttrSizedOperandSegments,
-  MemoryEffects<[MemRead<GlobalMemory>, MemWrite<SharedMemory>]>,
+  DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
   TypesMatchWith<"infer mask type from src type",
                  "src", "mask", "getI1SameShape($_self)",
                  "($_op.getOperands().size() <= 3) || std::equal_to<>()">,
@@ -144,6 +144,12 @@ def TTG_LocalAllocOp : TTG_Op<"local_alloc", [DeclareOpInterfaceMethods<MemoryEf
   }];
   let arguments = (ins Optional<TT_Tensor>:$src);
 
+  let extraClassDeclaration = [{
+    bool isSharedMemoryAlloc() {
+      return getType().getMemorySpace() &&
+             isa<SharedMemorySpaceAttr>(getType().getMemorySpace());
+    }
+  }];
   let assemblyFormat = [{$src attr-dict `:` functional-type(operands, results)}];
 
   let results = (outs TT_MemDescType:$result);
@@ -163,7 +169,7 @@ def TTG_LocalDeallocOp : TTG_Op<"local_dealloc", [MemoryEffects<[MemFree<SharedM
 
     Because we assume a memdesc is dead at the first point that post-dominates
     its uses, ops that wait for an async operation on a memdesc to complete
-    (such as triton_nvidia_gpu.dot_wait) should also take the memdesc as an
+    (such as triton_nvidia_gpu.warp_group_dot_wait) should also take the memdesc as an
     operand.
   }];
 
@@ -198,7 +204,7 @@ def TTG_MemDescSubviewOp : TTG_Op<"memdesc_subview", [Pure]> {
   let hasVerifier = 1;
 }
 
-def TTG_LocalLoadOp : TTG_Op<"local_load", [MemoryEffects<[MemRead<SharedMemory>]>]> {
+def TTG_LocalLoadOp : TTG_Op<"local_load", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Load a buffer from local memory into a distributed tensor";
 
   let description = [{
@@ -216,6 +222,20 @@ def TTG_LocalLoadOp : TTG_Op<"local_load", [MemoryEffects<[MemRead<SharedMemory>
   let assemblyFormat = [{$src (`token` $token^)? attr-dict `:` qualified(type($src)) `->` type($result)}];
 
   let results = (outs TT_Tensor:$result);
+}
+
+def TTG_LocalStoreOp : TTG_Op<"local_store", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Store a distributed tensor into a buffer in local memory";
+
+  let description = [{
+    Store a distributed tensor into a buffer in local memory.
+  }];
+  let arguments = (ins TT_Tensor:$src, TT_MemDescType:$dst);
+
+  // Use qualified() otherwise "!tt.memdesc<X>" is printed as "<X>".
+  let assemblyFormat = [{
+    $src `,` $dst attr-dict `:` type($src) `->` qualified(type($dst))
+  }];
 }
 
 #endif

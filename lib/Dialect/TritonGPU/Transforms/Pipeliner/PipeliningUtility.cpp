@@ -1,4 +1,4 @@
-#include "PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/TypeUtilities.h"
@@ -34,12 +34,17 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
   OpBuilder::InsertionGuard guard(rewriter);
   if (mlir::isMemoryEffectFree(op))
     return op;
-  if (isa<ttg::AsyncCommitGroupOp>(op))
+  if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op))
     return op;
-  if (isa<ttg::AsyncWaitOp>(op))
+  if (isa<ttg::LocalLoadOp, ttg::LocalStoreOp>(op))
     return op;
-  if (isa<ttg::LocalLoadOp>(op))
+  if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+    rewriter.setInsertionPoint(op);
+    Value cnd = getPredMask(rewriter, ifOp.getCondition().getType(),
+                            ifOp.getCondition(), pred);
+    ifOp.getConditionMutable().assign(cnd);
     return op;
+  }
   if (auto asyncCopyOp = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op)) {
     rewriter.setInsertionPoint(asyncCopyOp);
     Value mask = getPredMask(rewriter, asyncCopyOp.getSrc().getType(),
@@ -59,6 +64,13 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     Value mask = getPredMask(rewriter, copyOp.getPred().getType(),
                              copyOp.getPred(), pred);
     copyOp.getPredMutable().assign(mask);
+    return op;
+  }
+  if (auto expectOp = dyn_cast<ttng::BarrierExpectOp>(op)) {
+    rewriter.setInsertionPoint(expectOp);
+    Value mask = getPredMask(rewriter, expectOp.getPred().getType(),
+                             expectOp.getPred(), pred);
+    expectOp.getPredMutable().assign(mask);
     return op;
   }
 
