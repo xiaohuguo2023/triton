@@ -57,6 +57,7 @@ static void promoteReduceOpResult(OpBuilder &builder, triton::ReduceOp op,
 static int getCvtOpLDSUsage(triton::gpu::ConvertLayoutOp &cvtOp) {
   unsigned inVec = 0;
   unsigned outVec = 0;
+  constexpr int kPtrBitWidth = 64;
   auto smemShape = triton::getScratchConfigForCvtLayout(cvtOp, inVec, outVec);
   unsigned elems = getNumElements<unsigned>(smemShape);
   auto srcType = cvtOp.getSrc().getType();
@@ -193,11 +194,10 @@ struct DecomposeUnsupportedAMDConversions
       auto dstType = cvtOp.getType();
 
       auto srcEnc = srcType.getEncoding();
-      auto dstBlocked =
-          dstType.getEncoding().dyn_cast<triton::gpu::BlockedEncodingAttr>();
+      auto dstBlocked = dyn_cast<triton::gpu::BlockedEncodingAttr>(dstType.getEncoding());
 
       // TODO: Reduce LDS usage for WMMA dots
-      if (!srcEnc.isa<triton::gpu::AMDMfmaEncodingAttr>() || !dstBlocked) {
+      if (!isa<triton::gpu::AMDMfmaEncodingAttr>(srcEnc) || !dstBlocked) {
         return;
       }
 

@@ -25,7 +25,7 @@ int getCvtOpLDSUsage(RankedTensorType srcTy, RankedTensorType dstTy) {
   unsigned elems =
       std::accumulate(smemShape.begin(), smemShape.end(), 1, std::multiplies{});
   auto bytes =
-      srcTy.getElementType().isa<triton::PointerType>()
+      isa<triton::PointerType>(srcTy.getElementType())
           ? elems * kPtrBitWidth / 8
           : elems * std::max<int>(8, srcTy.getElementTypeBitWidth()) / 8;
 
@@ -64,24 +64,24 @@ std::vector<SmallVector<unsigned>> factorizePowerOf2(int n, int rank) {
 
 Attribute createTmpLayout(Attribute layout, ArrayRef<unsigned> warpsPerCTA) {
   auto ctx = layout.getContext();
-  if (auto src = layout.dyn_cast<triton::gpu::AMDMfmaEncodingAttr>())
+  if (auto src = dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(layout))
     return triton::gpu::AMDMfmaEncodingAttr::get(
         ctx, src.getVersionMajor(), src.getVersionMinor(), warpsPerCTA,
         src.getMDim(), src.getNDim(), src.getIsTransposed(),
         src.getCTALayout());
-  if (auto src = layout.dyn_cast<triton::gpu::AMDWmmaEncodingAttr>())
+  if (auto src = dyn_cast<triton::gpu::AMDWmmaEncodingAttr>(layout))
     return triton::gpu::AMDWmmaEncodingAttr::get(ctx, warpsPerCTA,
                                                  src.getCTALayout());
-  if (auto src = layout.dyn_cast<triton::gpu::BlockedEncodingAttr>())
+  if (auto src = dyn_cast<triton::gpu::BlockedEncodingAttr>(layout))
     return triton::gpu::BlockedEncodingAttr::get(
         ctx, src.getSizePerThread(), src.getThreadsPerWarp(), warpsPerCTA,
         src.getOrder(), src.getCTALayout());
-  if (auto src = layout.dyn_cast<triton::gpu::DotOperandEncodingAttr>()) {
+  if (auto src = dyn_cast<triton::gpu::DotOperandEncodingAttr>(layout)) {
     return triton::gpu::DotOperandEncodingAttr::get(
         ctx, src.getOpIdx(), createTmpLayout(src.getParent(), warpsPerCTA),
         src.getKWidth());
   }
-  if (auto src = layout.dyn_cast<triton::gpu::SliceEncodingAttr>())
+  if (auto src = dyn_cast<triton::gpu::SliceEncodingAttr>(layout))
     return triton::gpu::SliceEncodingAttr::get(
         ctx, src.getDim(), createTmpLayout(src.getParent(), warpsPerCTA));
   assert("Encountered unsupported layout");
