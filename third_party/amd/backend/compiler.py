@@ -258,6 +258,9 @@ class HIPBackend(BaseBackend):
             passes.common.add_canonicalizer(pm)
             amd.passes.ttgpuir.add_convert_to_buffer_ops(pm, options.arch)
 
+        if knobs.amd.rm_layoutconvert_tmpls:
+            amd.passes.ttgpuir.add_remove_layoutconvert_tmploadstore(pm)
+
         amd.passes.ttgpuir.add_fold_true_cmpi(pm)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)

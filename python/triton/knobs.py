@@ -371,6 +371,8 @@ class amd_knobs(base_knobs):
     global_prefetch: env_int = env_int("TRITON_HIP_GLOBAL_PREFETCH")
     local_prefetch: env_int = env_int("TRITON_HIP_LOCAL_PREFETCH")
     use_async_copy: env_bool = env_bool("TRITON_HIP_USE_ASYNC_COPY")
+    rm_layoutconvert_tmpls: env_int("TRITON_HIP_REMOVE_LAYOUTCONVERSION_TMPLS")
+
 
 
 class proton_knobs(base_knobs):

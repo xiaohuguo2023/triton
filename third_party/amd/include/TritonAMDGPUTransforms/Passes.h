@@ -26,6 +26,8 @@ std::unique_ptr<Pass> createTritonAMDGPUVerifier();
 
 std::unique_ptr<Pass> createTritonAMDGPUOptimizeEpiloguePass();
 
+std::unique_ptr<Pass> createTritonAMDGPURemoveLayoutConversionTMPLoadStorePass();
+
 std::unique_ptr<Pass> createTritonAMDGPUHoistLayoutConversionsPass();
 
 std::unique_ptr<Pass> createTritonAMDGPUCanonicalizePointersPass();

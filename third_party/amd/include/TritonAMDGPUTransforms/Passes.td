@@ -68,6 +68,18 @@ def TritonAMDGPUOptimizeEpilogue : Pass<"tritonamdgpu-optimize-epilogue", "mlir:
 
 }
 
+def TritonAMDGPU : Pass<"tritonamdgpu-Remove-LayoutConversion-TMPLoadStore", "mlir::ModuleOp"> {
+  let summary = "Optimize streamk remainder";
+
+  let description = [{
+  }];
+
+  let constructor = "mlir::createTritonAMDGPURemoveLayoutConversionTMPLoadStorePass()";
+
+  let dependentDialects = [];
+
+}
+
 def TritonAMDGPUHoistLayoutConversions : Pass<"tritonamdgpu-hoist-layout-conversions", "mlir::triton::FuncOp"> {
   let summary = "Hoist layout conversions out of the loop";
 
