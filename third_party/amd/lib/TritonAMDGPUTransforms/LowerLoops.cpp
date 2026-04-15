@@ -1,4 +1,5 @@
 #include "TritonAMDGPUTransforms/Passes.h"
+#include "TritonAMDGPUTransforms/PerfModelIR.h"
 #include "Utility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/AsyncUtility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/TargetInfo.h"
@@ -511,6 +512,36 @@ LogicalResult initSchedule(int maxDist, Stages &stages, int numStages,
   }
 
   LDBG("deduced max shared memory buffer number = " << numBuffers);
+
+  // Analytical LDS capacity guard.  LDS overflow is a silent miscompile:
+  // pipeline stages alias each other's buffers, producing wrong results at
+  // runtime.  Catch it here with a hard error so the user gets an actionable
+  // diagnostic instead of wrong output.
+  //
+  // Note: this check uses the formula-based estimate (PerfModel.h) because
+  // AllocateSharedMemory has not run yet.  The estimate is conservative:
+  // it uses 8-element row padding, which is a safe upper bound.  After
+  // AllocateSharedMemory runs the exact bytes are available via
+  // perf::ldsFromAllocation() in PerfModelIR.h.
+  if (auto dotOp = dyn_cast_or_null<tt::DotOp>(schedule.begin()->first)) {
+    namespace perf = mlir::triton::AMD::perf;
+    auto mod = dotOp->getParentOfType<ModuleOp>();
+    auto hw   = perf::hardwareInfoFromModule(mod);
+    if (hw.arch != perf::Arch::Unknown && hw.ldsPerCU > 0) {
+      auto prob = perf::gemmProblemFromDotOp(dotOp);
+      auto cfg  = perf::tritonConfigFromDotOpPost(dotOp, numStages);
+      int  lds  = perf::estimateLdsBytes(prob, cfg, hw);
+      if (lds > hw.ldsPerCU) {
+        dotOp.emitError()
+            << "[PerfModel] LDS usage ~" << lds << " B exceeds device limit "
+            << hw.ldsPerCU << " B for " << numBuffers << " pipeline buffers"
+            << " — reduce num_stages or block sizes";
+        return failure();
+      }
+      LDBG("PerfModel LDS check passed: ~" << lds << " B / " << hw.ldsPerCU
+                                           << " B");
+    }
+  }
 
   // We place async wait as the first cluster because we want to have it being
   // the first in the main loop after pipelining.

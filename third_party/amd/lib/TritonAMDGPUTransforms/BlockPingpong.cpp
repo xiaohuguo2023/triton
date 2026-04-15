@@ -1,4 +1,5 @@
 #include "TritonAMDGPUTransforms/Passes.h"
+#include "TritonAMDGPUTransforms/PerfModelIR.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
@@ -1062,10 +1063,42 @@ void Pingponger::getDotPingponged() {
   auto elemWidth = aType.getElementTypeBitWidth();
   int64_t tileSize = dotShape[0] * dotShape[1] * aShape[1] * elemWidth;
 
-  const int64_t minTile = 262144;      // e.g. 32x128x64x16bit
-  const int64_t smallTile = 16777216;  // e.g. 128x128x64x16bit
-  const int64_t mediumTile = 33554432; // smallTile x 2
-  const int64_t largeTile = 67108864;  // e.g. 256x256x64x16bit
+  // Original empirical thresholds — kept as comments for reference and
+  // used as the fallback when the analytical model is unavailable.
+  //   minTile   = 262144   (e.g. 32×128×64×16-bit)
+  //   smallTile = 16777216 (e.g. 128×128×64×16-bit)
+  //   mediumTile= 33554432 (smallTile × 2)
+  //   largeTile = 67108864 (e.g. 256×256×64×16-bit)
+  //
+  // The analytical model classifies the workload from first principles so
+  // the thresholds become model outputs rather than hard-coded constants.
+  namespace perf = mlir::triton::AMD::perf;
+  auto mod = dotOps[0]->getParentOfType<ModuleOp>();
+  auto perfHw = perf::hardwareInfoFromModule(mod);
+  perf::PerfEstimate perfEst;
+  bool useModel = (perfHw.arch != perf::Arch::Unknown && perfHw.numCUs > 0);
+  if (useModel) {
+    auto prob = perf::gemmProblemFromDotOp(dotOps[0]);
+    auto cfg  = perf::tritonConfigFromDotOpPost(dotOps[0], numStages);
+    perfEst   = perf::estimatePerf(prob, cfg, perfHw);
+    if (!perfEst.isValid) {
+      LDBG("PerfModel: config not feasible (ldsExceeded="
+           << perfEst.ldsExceeded << " likelySpills=" << perfEst.likelySpills
+           << "), skipping ping-pong");
+      return;
+    }
+    LDBG("PerfModel: isComputeBound=" << perfEst.isComputeBound
+                                      << " occupancy=" << perfEst.occupancy
+                                      << " waveEfficiency="
+                                      << perfEst.waveEfficiency);
+  }
+
+  // Derive effective tile classifications from the model, falling back to
+  // the original numeric thresholds when the model is unavailable.
+  const int64_t minTile   = 262144;
+  const int64_t smallTile = 16777216;
+  const int64_t mediumTile= 33554432;
+  const int64_t largeTile = 67108864;
 
   auto encoding = cast<RankedTensorType>(aType).getEncoding();
   auto srcEncoding = cast<ttg::DotOperandEncodingAttr>(encoding);
@@ -1228,9 +1261,14 @@ void Pingponger::getDotPingponged() {
         return;
       }
     } else if (tileSize >= largeTile) {
-      // Avoid known register spilling. i.e., mfma16x16x16 & largetile & kpack>1
-      if (intShape[0] == 16 && intShape[1] == 16 && kWidth == 8) {
-        LDBG("Reached known register spilling case, skip pingpong scheduling");
+      // Avoid register spilling: use model prediction when available,
+      // fall back to the original hardcoded rule (mfma16x16 + kWidth=8).
+      bool predictedSpill = useModel ? perfEst.likelySpills
+                                     : (intShape[0] == 16 && intShape[1] == 16
+                                        && kWidth == 8);
+      if (predictedSpill) {
+        LDBG("Predicted register spilling, skip pingpong scheduling"
+             << (useModel ? " (PerfModel)" : " (heuristic)"));
         return;
       }
       if (transformFourPPClusters(builder, dotOps[0]->getLoc()).failed()) {
