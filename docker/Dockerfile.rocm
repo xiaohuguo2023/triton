@@ -1,0 +1,129 @@
+# Triton AMD experiment build image
+#
+# Mirrors the CI environment from .github/workflows/integration-tests-amd.yml
+# but runs as a non-root user matching the host UID/GID so that files written
+# to mounted volumes are owned by the developer, not root.
+#
+# Base image: rocm/pytorch:rocm7.0_ubuntu22.04_py3.10_pytorch_release_2.8.0
+#   - ROCm 7.0  |  Ubuntu 22.04  |  Python 3.10  |  PyTorch 2.8.0
+#
+# Build:
+#   docker build \
+#     --build-arg USERNAME=xiaohugu \
+#     --build-arg USER_UID=$(id -u) \
+#     --build-arg USER_GID=$(id -g) \
+#     -f docker/Dockerfile.rocm \
+#     -t triton-rocm-dev .
+#
+#   Or just use ./docker/run.sh which handles all of this automatically.
+#
+# Run (AMD GPU):
+#   ./docker/run.sh    # interactive shell, then inside:
+#     pip install -r python/requirements.txt
+#     pip install -e . --no-build-isolation
+#   HIP_VISIBLE_DEVICES=0 ./docker/run.sh python bench.py
+#
+# setup.py imports pybind11 at module level so python/requirements.txt
+# (cmake, ninja, pybind11, lit) must be installed before the editable install.
+# --no-build-isolation reuses the ROCm PyTorch in the base image instead of
+# pulling in a CPU-only torch in an isolated build environment.
+
+FROM rocm/pytorch:rocm7.0_ubuntu22.04_py3.10_pytorch_release_2.8.0
+
+# ── Build-time arguments ───────────────────────────────────────────────────────
+# Default to the developer's identity; override at build time with --build-arg.
+ARG USERNAME=xiaohugu
+ARG USER_UID=10213
+ARG USER_GID=10213
+
+# ── System dependencies ────────────────────────────────────────────────────────
+# Identical to the CI "Install dependencies" step, plus sudo so the developer
+# can install additional packages inside the container without rebuilding.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        clang \
+        lld \
+        ccache \
+        sudo \
+        git \
+        ninja-build \
+        cmake \
+        wget \
+        vim \
+        nano \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python dependencies ────────────────────────────────────────────────────────
+# Install hip-python and Triton's build requirements into the base image's
+# /opt/venv while still root, so the developer user doesn't need sudo to build.
+#
+# python/requirements.txt contents (pinned here so we don't need the source
+# tree at image-build time):
+#   setuptools>=40.8.0, wheel, cmake>=3.20,<4.0, ninja>=1.11.1,
+#   pybind11>=2.13.1, lit
+#
+# setup.py imports pybind11 at module level, so these must be present before
+# `pip install -e . --no-build-isolation` is run by the developer.
+RUN pip install --no-cache-dir \
+        hip-python \
+        "setuptools>=40.8.0" \
+        wheel \
+        "cmake>=3.20,<4.0" \
+        "ninja>=1.11.1" \
+        "pybind11>=2.13.1" \
+        lit
+
+# ── Create developer user ──────────────────────────────────────────────────────
+# Match the host UID/GID exactly so files written on mounted volumes (the
+# Triton source tree, build cache, pip cache) are owned by the developer and
+# not root.  This prevents the "permission denied" git pull issues that arise
+# when the container runs as root.
+#
+# Steps:
+#  1. Create the group (skip if GID already exists in the base image).
+#  2. Create the user with a home directory.
+#  3. Add to video + render groups — required for /dev/kfd and /dev/dri access.
+#  4. Grant passwordless sudo so the developer can apt-get inside the container.
+RUN groupadd --gid ${USER_GID} ${USERNAME} 2>/dev/null || true && \
+    useradd \
+        --uid ${USER_UID} \
+        --gid ${USER_GID} \
+        --create-home \
+        --shell /bin/bash \
+        ${USERNAME} && \
+    usermod -aG video,render,kvm ${USERNAME} && \
+    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} && \
+    chmod 0440 /etc/sudoers.d/${USERNAME}
+
+# ── Compiler selection ─────────────────────────────────────────────────────────
+ENV CC=/usr/bin/clang
+ENV CXX=/usr/bin/clang++
+
+# ── Build flags (matching CI environment variables) ───────────────────────────
+ENV TRITON_BUILD_WITH_CCACHE=true
+ENV TRITON_BUILD_WITH_CLANG_LLD=TRUE
+ENV TRITON_USE_ASSERT_ENABLED_LLVM=TRUE
+ENV TRITON_DISABLE_LINE_INFO=1
+ENV PROTON_SKIP_PC_SAMPLING_TEST=1
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ENV CCACHE_COMPRESS=true
+
+# ── Cache directories ──────────────────────────────────────────────────────────
+# Point ccache and Triton's own cache to the home directory of the developer
+# user.  Both will be volume-mounted from the host at runtime so they persist
+# across container restarts.
+ENV CCACHE_DIR=/home/${USERNAME}/.ccache
+RUN mkdir -p /home/${USERNAME}/.ccache /home/${USERNAME}/.triton && \
+    chown -R ${USER_UID}:${USER_GID} /home/${USERNAME} && \
+    chown -R ${USER_UID}:${USER_GID} /opt/venv
+
+# ── Switch to developer user ───────────────────────────────────────────────────
+# All subsequent RUN/CMD/ENTRYPOINT instructions and the runtime process run
+# as the developer, not root.
+USER ${USERNAME}
+
+# The Triton source tree is expected to be mounted at /triton at runtime.
+WORKDIR /triton
+
+CMD ["/bin/bash"]
