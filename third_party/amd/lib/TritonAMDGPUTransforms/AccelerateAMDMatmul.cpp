@@ -1,6 +1,7 @@
 #include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "TritonAMDGPUTransforms/MfmaGroup.h"
 #include "TritonAMDGPUTransforms/Passes.h"
+#include "TritonAMDGPUTransforms/PerfModelIR.h"
 #include "TritonAMDGPUTransforms/WmmaGroup.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/TypeUtilities.h"
@@ -174,24 +175,47 @@ chooseMfmaInstruction(Location loc, int mfmaVersion, RankedTensorType cType,
   if (enforcedNonKDim != 0) {
     mDim = nDim = enforcedNonKDim;
   } else {
-    int minSize = std::min(M, N);
-    if (minSize >= 32) {
-      // On CNDA2-4, if the element type is f64, we use 16x16 intrinsic as
-      // there's no 32x32 intrinsic.
-      mDim = nDim = 32;
-      if (aElemType.isF64() || bElemType.isF64()) {
-        mDim = nDim = 16;
-      }
-    } else if (minSize >= 16) {
+    // F64 has no 32x32 intrinsic — always use 16x16.
+    if (aElemType.isF64() || bElemType.isF64()) {
       mDim = nDim = 16;
-    } else if (minSize >= 4) {
-      if (M >= 64) {
-        mDim = 64;
-        nDim = 4;
-      } else if (N >= 64) {
-        mDim = 4;
-        nDim = 64;
-      }
+    } else if (M < 4 || N < 4) {
+      // Tiles smaller than 4 cannot use any MFMA; fall through to FMA.
+    } else if (M < 16 || N < 16) {
+      mDim = 64; nDim = 4;
+      if (N >= 64) { mDim = 4; nDim = 64; }
+    } else {
+      // Use the analytical model to pick between 32x32 and 16x16, taking
+      // VGPR budget into account.  Falls back to 16 or 4 automatically.
+      // NOTE: cType is the GEMM result type; loc comes from the outer scope.
+      // We build minimal GemmProblem and TritonGemmConfig from cType alone
+      // since the dot op itself is not available in this function signature.
+      // The arch string is fetched from the module attribute.
+      // For the experiment branch we use a simplified inline selection that
+      // replicates selectMfmaNonKDim logic without needing a full DotOp.
+      namespace perf = mlir::triton::AMD::perf;
+      perf::GemmProblem prob;
+      prob.M = M; prob.N = N; prob.K = inputKSize;
+      prob.aKind = perf::elemKindFromMlirType(aElemType);
+      prob.cKind = perf::elemKindFromMlirType(cType.getElementType());
+      prob.aBits = aElemType.getIntOrFloatBitWidth();
+      prob.cBits = cType.getElementType().getIntOrFloatBitWidth();
+
+      // Arch is not directly available here; derive from mfmaVersion.
+      // CDNA1=1, CDNA2=2, CDNA3=3, CDNA4=4. Map to Arch enum.
+      static const perf::Arch versionToArch[] = {
+          perf::Arch::Unknown, perf::Arch::CDNA1, perf::Arch::CDNA2,
+          perf::Arch::CDNA3,   perf::Arch::CDNA4,
+      };
+      perf::Arch arch = (mfmaVersion >= 1 && mfmaVersion <= 4)
+                            ? versionToArch[mfmaVersion]
+                            : perf::Arch::Unknown;
+      perf::HardwareInfo hw = perf::HardwareInfo::get(arch);
+
+      perf::TritonGemmConfig cfg;
+      cfg.blockM = M; cfg.blockN = N; cfg.blockK = inputKSize;
+
+      int dim = perf::selectMfmaNonKDim(prob, cfg, hw);
+      mDim = nDim = (unsigned)dim;
     }
   }
 
