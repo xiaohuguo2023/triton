@@ -27,7 +27,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-IMAGE="${TRITON_DOCKER_IMAGE:-triton-rocm-dev}"
+IMAGE="${TRITON_DOCKER_IMAGE:-xguo-triton-dev}"
 
 HOST_USER="$(id -un)"
 HOST_UID="$(id -u)"
