@@ -452,15 +452,22 @@ void AssignDescriptorMemoryLayouts::runOnFunction(FuncOp &func) {
 
   SmallVector<Type> argTys(func.getBlocks().front().getArgumentTypes());
   SmallVector<Type> resultTys(func.getResultTypes());
+  bool funcTypeChanged = false;
   for (auto [i, resultTy] : llvm::enumerate(resultTys)) {
     if (auto descTy = dyn_cast<TensorDescType>(resultTy)) {
       auto encoding =
           getFallbackSharedEncoding(descTy.getBlockType(), {}, {}, numCTAs);
-      resultTys[i] = getTensorDescTypeWithEncoding(
+      Type newTy = getTensorDescTypeWithEncoding(
           nullptr, descTy.getBlockType(), encoding);
+      if (newTy != resultTys[i]) {
+        resultTys[i] = newTy;
+        funcTypeChanged = true;
+      }
     }
   }
-  func.setFunctionType(FunctionType::get(ctx, argTys, resultTys));
+  auto currentArgTys = SmallVector<Type>(func.getFunctionType().getInputs());
+  if (funcTypeChanged || currentArgTys != argTys)
+    func.setFunctionType(FunctionType::get(ctx, argTys, resultTys));
 }
 
 void AssignDescriptorMemoryLayouts::assignMemoryLayouts(ModuleOp &mod) {
