@@ -360,47 +360,57 @@ std::optional<MfmaInstrInfo> getMfmaInstrInfo(Arch arch, int mDim, int nDim,
 // Placed before the resource-accounting section because deriveKWidth() (below)
 // calls selectMfmaNonKDim() when cfg.kWidth == 0 and cfg.mfmaNonKDim == 0.
 // Defining it here removes any ambiguity about definition order.
-//
-// Call graph:
-//   selectMfmaNonKDim → estimateVgpr     (declared in header; defined below)
-//   estimateVgpr      → deriveKWidth     (static; defined below)
-//   deriveKWidth      → selectMfmaNonKDim (defined here — no forward ref needed)
-//
-// Mutual recursion terminates because selectMfmaNonKDim always sets
-// testCfg.mfmaNonKDim = dim (non-zero) before calling estimateVgpr, which
-// causes deriveKWidth to take the direct kDim/mDim path and not recurse.
 
 int selectMfmaNonKDim(const GemmProblem &prob, const TritonGemmConfig &cfg,
                       const HardwareInfo &hw) {
-  // Edge case: very small M or N → use 4×4 or 4×64 tile.
+  // Tiny tiles: no standard 16x16 or 32x32 MFMA available.
   if (std::min(cfg.blockM, cfg.blockN) < 16)
     return 4;
 
-  // Try 32×32 first.  Accept it if:
-  //   (a) an intrinsic exists for this arch/dtype combination, and
-  //   (b) the occupancy with 32×32 accumulators is acceptable (≥ 1 wave/SIMD).
+  // Iterate over kMfmaThroughputTable and pick the square MFMA instruction
+  // with the highest throughput, matching Origami's
+  // get_recommended_matrix_instruction() logic:
   //
-  // The accumulator footprint with 32×32 is always larger than with 16×16 for
-  // the same block sizes, so if 32×32 spills we fall back to 16×16.
-  auto check = [&](int dim) -> bool {
-    if (!getMfmaInstrInfo(hw.arch, dim, dim, prob.aKind, prob.cKind))
-      return false;
-    TritonGemmConfig testCfg = cfg;
-    testCfg.mfmaNonKDim = dim; // must be non-zero to break the recursion
-    int vgpr = estimateVgpr(prob, testCfg, hw);
-    return vgpr <= hw.vgprPerSimd;
-  };
+  //   throughput = (M * N * K) / (throughputCycles / numSimdPerCU)
+  //
+  // Tie-breaking rule: prefer 16x16 over 32x32 when throughput is equal.
+  // On CDNA3/4 (gfx942/gfx950), 32x32 and 16x16 always tie, so 16x16 wins.
+  // On CDNA2 (gfx90a) with BF16, 32x32 genuinely has higher throughput.
+  int bestDim = 0;
+  double bestThroughput = -1.0;
 
-  // Prefer 32×32 for better MFMA utilisation when the block is large enough.
-  if (std::min(cfg.blockM, cfg.blockN) >= 32 && check(32))
-    return 32;
+  for (const auto &e : kMfmaThroughputTable) {
+    if (e.arch != hw.arch || e.aKind != prob.aKind || e.cKind != prob.cKind)
+      continue;
+    // Only consider square MFMA tiles (mDim == nDim).
+    if (e.mDim != e.nDim)
+      continue;
+    // Block must be at least as large as the instruction tile.
+    if (cfg.blockM < e.mDim || cfg.blockN < e.nDim)
+      continue;
 
-  // 16×16 is the universal fallback for all CDNA/RDNA generations.
-  if (check(16))
+    int effectiveCycles = e.throughputCycles / hw.numSimdPerCU;
+    if (effectiveCycles <= 0)
+      continue;
+
+    double throughput =
+        static_cast<double>(e.mDim * e.nDim * e.kDim) / effectiveCycles;
+
+    bool isBetter = throughput > bestThroughput;
+    bool isTiePrefer16 =
+        (throughput == bestThroughput) && (e.mDim == 16) && (bestDim != 16);
+
+    if (isBetter || isTiePrefer16) {
+      bestThroughput = throughput;
+      bestDim = e.mDim;
+    }
+  }
+
+  // Fallback: unknown arch or dtype not in table — use 16x16.
+  if (bestDim == 0)
     return 16;
 
-  // Last resort: 4×4 (avoids hard register spilling at the cost of efficiency).
-  return 4;
+  return bestDim;
 }
 
 //===----------------------------------------------------------------------===//
