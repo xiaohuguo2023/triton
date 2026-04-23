@@ -1,7 +1,13 @@
+add_triton_library(TritonAMDPerfModel
+  PerfModel.cpp
+)
+
+target_include_directories(TritonAMDPerfModel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+target_include_directories(TritonAMDPerfModel PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/../../include)
+
 add_triton_library(TritonAMDGPUTransforms
   AccelerateAMDMatmul.cpp
   BlockPingpong.cpp
-  PerfModel.cpp
   PerfModelIR.cpp
   CanonicalizePointers.cpp
   CoalesceAsyncCopy.cpp
@@ -29,6 +35,7 @@ add_triton_library(TritonAMDGPUTransforms
   WarpPipeliner.cpp
 
   DEPENDS
+  TritonAMDPerfModel
   TritonAMDGPUIR
   TritonAMDGPUTransformsIncGen
   TritonGPUIR
