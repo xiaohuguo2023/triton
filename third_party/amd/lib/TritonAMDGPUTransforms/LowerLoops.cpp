@@ -523,23 +523,33 @@ LogicalResult initSchedule(int maxDist, Stages &stages, int numStages,
   // it uses 8-element row padding, which is a safe upper bound.  After
   // AllocateSharedMemory runs the exact bytes are available via
   // perf::ldsFromAllocation() in PerfModelIR.h.
-  if (auto dotOp = dyn_cast_or_null<tt::DotOp>(schedule.begin()->first)) {
+  //
+  // Note: CoarseSchedule iterates in insertion order, not execution order.
+  // local_load ops are inserted before the dot, so schedule.begin() is never
+  // a DotOp.  Search the whole schedule for the first DotOp instead.
+  {
     namespace perf = mlir::triton::AMD::perf;
-    auto mod = dotOp->getParentOfType<ModuleOp>();
-    auto hw   = perf::hardwareInfoFromModule(mod);
-    if (hw.arch != perf::Arch::Unknown && hw.ldsPerCU > 0) {
-      auto prob = perf::gemmProblemFromDotOp(dotOp);
-      auto cfg  = perf::tritonConfigFromDotOpPost(dotOp, numStages);
-      int  lds  = perf::estimateLdsBytes(prob, cfg, hw);
-      if (lds > hw.ldsPerCU) {
-        dotOp.emitError()
-            << "[PerfModel] LDS usage ~" << lds << " B exceeds device limit "
-            << hw.ldsPerCU << " B for " << numBuffers << " pipeline buffers"
-            << " — reduce num_stages or block sizes";
-        return failure();
+    tt::DotOp dotOp = nullptr;
+    for (auto &[op, stageAndCluster] : schedule)
+      if ((dotOp = dyn_cast<tt::DotOp>(op)))
+        break;
+    if (dotOp) {
+      auto mod = dotOp->getParentOfType<ModuleOp>();
+      auto hw  = perf::hardwareInfoFromModule(mod);
+      if (hw.arch != perf::Arch::Unknown && hw.ldsPerCU > 0) {
+        auto prob = perf::gemmProblemFromDotOp(dotOp);
+        auto cfg  = perf::tritonConfigFromDotOpPost(dotOp, numStages);
+        int  lds  = perf::estimateLdsBytes(prob, cfg, hw);
+        if (lds > hw.ldsPerCU) {
+          dotOp.emitError()
+              << "[PerfModel] LDS usage ~" << lds << " B exceeds device limit "
+              << hw.ldsPerCU << " B for " << numBuffers << " pipeline buffers"
+              << " — reduce num_stages or block sizes";
+          return failure();
+        }
+        LDBG("PerfModel LDS check passed: ~" << lds << " B / " << hw.ldsPerCU
+                                             << " B");
       }
-      LDBG("PerfModel LDS check passed: ~" << lds << " B / " << hw.ldsPerCU
-                                           << " B");
     }
   }
 
