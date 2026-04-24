@@ -297,6 +297,23 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
 int selectMfmaNonKDim(const GemmProblem &prob, const TritonGemmConfig &cfg,
                       const HardwareInfo &hw);
 
+/// Generate a candidate set of TritonGemmConfig tuples for a given problem
+/// and hardware target.
+///
+/// Tile size generation follows Origami's wave-based approach:
+///   blockM = mfmaDim × waveTileM × waveCountM
+///   blockN = mfmaDim × waveTileN × waveCountN
+///   blockK = multiple of the MFMA kDim from the throughput table
+///
+/// numWarps is swept over {1, 2, 4, 8}. numStages is swept over {1, 2, 3, 4}.
+/// All candidates are filtered through isValidConfig — only feasible configs
+/// (LDS fits, VGPR fits, kDim alignment) are returned.
+///
+/// The returned list is unranked; pass it to rankConfigs() to sort by
+/// predicted TFLOPS.
+std::vector<TritonGemmConfig>
+generateCandidates(const GemmProblem &prob, const HardwareInfo &hw);
+
 } // namespace mlir::triton::AMD::perf
 
 #endif // TRITON_THIRD_PARTY_AMD_INCLUDE_TRITONAMDGPUTRANSFORMS_PERFMODEL_H_
