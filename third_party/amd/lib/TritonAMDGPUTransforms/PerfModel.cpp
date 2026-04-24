@@ -772,4 +772,99 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
   return result;
 }
 
+//===----------------------------------------------------------------------===//
+// 8. Candidate config generation
+//===----------------------------------------------------------------------===//
+
+std::vector<TritonGemmConfig>
+generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
+  // Step 1: pick the MFMA instruction dimension using the throughput model.
+  // Use a probe config (blockM=blockN=128) to let selectMfmaNonKDim run.
+  // The result is arch+dtype specific and independent of tile size.
+  TritonGemmConfig probe;
+  probe.blockM = 128;
+  probe.blockN = 128;
+  probe.blockK = 32;
+  probe.mfmaNonKDim = 0; // let model choose
+  const int mfmaDim = selectMfmaNonKDim(prob, probe, hw);
+
+  // Step 2: determine valid blockK values — multiples of the MFMA kDim.
+  // Look up kDim from the throughput table for this arch+dtype combination.
+  int mfmaKDim = 16; // safe default
+  if (auto info = getMfmaInstrInfo(hw.arch, mfmaDim, mfmaDim,
+                                   prob.aKind, prob.cKind))
+    mfmaKDim = info->kDim;
+
+  // blockK candidates: 1×, 2×, 4×, 8× the MFMA kDim, capped at 256.
+  // Larger blockK improves arithmetic intensity but inflates LDS.
+  const int blockKCandidates[] = {
+      mfmaKDim,
+      mfmaKDim * 2,
+      mfmaKDim * 4,
+      mfmaKDim * 8,
+  };
+
+  // Step 3: generate (blockM, blockN) pairs using Origami's wave-based formula:
+  //   blockM = mfmaDim × waveTileM × waveCountM
+  //   blockN = mfmaDim × waveTileN × waveCountN
+  // waveTile sweeps {1, 2, 4}, waveCount sweeps {1, 2, 4}.
+  // Cap at 256 to avoid unrealistically large tiles.
+  const int waveTiles[]  = {1, 2, 4};
+  const int waveCounts[] = {1, 2, 4};
+  const int maxTile = 256;
+
+  std::vector<std::pair<int, int>> mnPairs;
+  for (int wtM : waveTiles) {
+    for (int wcM : waveCounts) {
+      int bM = mfmaDim * wtM * wcM;
+      if (bM < mfmaDim || bM > maxTile)
+        continue;
+      for (int wtN : waveTiles) {
+        for (int wcN : waveCounts) {
+          int bN = mfmaDim * wtN * wcN;
+          if (bN < mfmaDim || bN > maxTile)
+            continue;
+          mnPairs.emplace_back(bM, bN);
+        }
+      }
+    }
+  }
+  // Deduplicate (blockM, blockN) pairs.
+  std::sort(mnPairs.begin(), mnPairs.end());
+  mnPairs.erase(std::unique(mnPairs.begin(), mnPairs.end()), mnPairs.end());
+
+  // Step 4: sweep numWarps and numStages.
+  const int numWarpsCandidates[]  = {1, 2, 4, 8};
+  const int numStagesCandidates[] = {1, 2, 3, 4};
+
+  // Step 5: enumerate all combinations and keep feasible ones.
+  std::vector<TritonGemmConfig> candidates;
+  for (auto [bM, bN] : mnPairs) {
+    for (int bK : blockKCandidates) {
+      if (bK > 256)
+        continue;
+      for (int nW : numWarpsCandidates) {
+        for (int nS : numStagesCandidates) {
+          TritonGemmConfig cfg;
+          cfg.blockM      = bM;
+          cfg.blockN      = bN;
+          cfg.blockK      = bK;
+          cfg.numWarps    = nW;
+          cfg.numStages   = nS;
+          cfg.mfmaNonKDim = mfmaDim;
+          cfg.kWidth      = 0;         // let estimateVgpr derive it
+          cfg.bypassLds   = false;
+          cfg.useAsyncCopy = true;
+          cfg.kPack       = 1;
+          cfg.wavesPerEu  = 0;
+
+          if (isValidConfig(prob, cfg, hw))
+            candidates.push_back(cfg);
+        }
+      }
+    }
+  }
+  return candidates;
+}
+
 } // namespace mlir::triton::AMD::perf

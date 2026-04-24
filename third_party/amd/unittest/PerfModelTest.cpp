@@ -5,6 +5,7 @@
 //   - isValidConfig: LDS / VGPR / alignment feasibility check
 //   - rankConfigs:   sort candidates by predicted TFLOPS
 //   - selectMfmaNonKDim: throughput-based 16x16 vs 32x32 selection
+//   - generateCandidates: wave-based config space generation
 //
 // All tests are pure C++ (no GPU, no MLIR context required).
 //===----------------------------------------------------------------------===//
@@ -265,6 +266,76 @@ TEST(SelectMfmaNonKDim, UnknownArchFallsBackTo16) {
   unknownHw.numSimdPerCU = 4;
   int dim = selectMfmaNonKDim(fp16Problem(), cfg, unknownHw);
   EXPECT_EQ(dim, 16);
+}
+
+// ---------------------------------------------------------------------------
+// generateCandidates tests
+// ---------------------------------------------------------------------------
+
+TEST(GenerateCandidates, ProducesNonEmptySetForGfx942Fp16) {
+  auto candidates = generateCandidates(fp16Problem(), gfx942());
+  EXPECT_GT(candidates.size(), 0u);
+}
+
+TEST(GenerateCandidates, AllReturnedConfigsAreValid) {
+  auto candidates = generateCandidates(fp16Problem(), gfx942());
+  for (const auto &cfg : candidates)
+    EXPECT_TRUE(isValidConfig(fp16Problem(), cfg, gfx942()))
+        << "Invalid config: blockM=" << cfg.blockM << " blockN=" << cfg.blockN
+        << " blockK=" << cfg.blockK << " numWarps=" << cfg.numWarps
+        << " numStages=" << cfg.numStages;
+}
+
+TEST(GenerateCandidates, MfmaDimIsConsistent) {
+  // All candidates should use the same mfmaNonKDim (selected once by the
+  // throughput model for this arch+dtype).
+  auto candidates = generateCandidates(fp16Problem(), gfx942());
+  ASSERT_GT(candidates.size(), 0u);
+  int expectedDim = candidates[0].mfmaNonKDim;
+  EXPECT_GT(expectedDim, 0);
+  for (const auto &cfg : candidates)
+    EXPECT_EQ(cfg.mfmaNonKDim, expectedDim);
+}
+
+TEST(GenerateCandidates, Gfx942Fp16MfmaDimIs16) {
+  // On gfx942 FP16, throughput ties → tiebreak selects 16x16.
+  auto candidates = generateCandidates(fp16Problem(), gfx942());
+  ASSERT_GT(candidates.size(), 0u);
+  EXPECT_EQ(candidates[0].mfmaNonKDim, 16);
+}
+
+TEST(GenerateCandidates, BlockSizesAreMultiplesOfMfmaDim) {
+  auto candidates = generateCandidates(fp16Problem(), gfx942());
+  for (const auto &cfg : candidates) {
+    EXPECT_EQ(cfg.blockM % cfg.mfmaNonKDim, 0)
+        << "blockM=" << cfg.blockM << " not multiple of mfmaDim=" << cfg.mfmaNonKDim;
+    EXPECT_EQ(cfg.blockN % cfg.mfmaNonKDim, 0)
+        << "blockN=" << cfg.blockN << " not multiple of mfmaDim=" << cfg.mfmaNonKDim;
+  }
+}
+
+TEST(GenerateCandidates, RankedOutputHasBestFirst) {
+  auto candidates = generateCandidates(fp16Problem(), gfx942());
+  auto ranked = rankConfigs(fp16Problem(), candidates, gfx942());
+  ASSERT_GT(ranked.size(), 1u);
+  // First config should have higher or equal TFLOPS than the second.
+  auto est0 = estimatePerf(fp16Problem(), ranked[0], gfx942());
+  auto est1 = estimatePerf(fp16Problem(), ranked[1], gfx942());
+  EXPECT_GE(est0.predictedTflops, est1.predictedTflops);
+}
+
+TEST(GenerateCandidates, WorksForGfx90a) {
+  auto candidates = generateCandidates(fp16Problem(), gfx90a());
+  EXPECT_GT(candidates.size(), 0u);
+  for (const auto &cfg : candidates)
+    EXPECT_TRUE(isValidConfig(fp16Problem(), cfg, gfx90a()));
+}
+
+TEST(GenerateCandidates, WorksForGfx950) {
+  auto candidates = generateCandidates(fp16Problem(), gfx950());
+  EXPECT_GT(candidates.size(), 0u);
+  for (const auto &cfg : candidates)
+    EXPECT_TRUE(isValidConfig(fp16Problem(), cfg, gfx950()));
 }
 
 } // namespace
