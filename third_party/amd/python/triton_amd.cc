@@ -2,6 +2,7 @@
 #include "TritonAMDGPUToLLVM/Passes.h"
 #include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "TritonAMDGPUTransforms/Passes.h"
+#include "TritonAMDGPUTransforms/PerfModel.h"
 #include "amd/include/hipblas_instance.h"
 #include "amd/include/hipblas_types.h"
 #include "lib/TritonAMDGPUToLLVM/TargetInfo.h"
@@ -342,11 +343,149 @@ static std::optional<std::string> lldInvoke(const char *inPath,
   return {};
 }
 
+void init_triton_amd_perf_model(py::module &&m) {
+  using namespace mlir::triton::AMD::perf;
+
+  // ── ElemKind enum ──────────────────────────────────────────────────────────
+  py::enum_<ElemKind>(m, "ElemKind")
+      .value("FP64", ElemKind::FP64)
+      .value("FP32", ElemKind::FP32)
+      .value("TF32", ElemKind::TF32)
+      .value("FP16", ElemKind::FP16)
+      .value("BF16", ElemKind::BF16)
+      .value("FP8",  ElemKind::FP8)
+      .value("FP6",  ElemKind::FP6)
+      .value("FP4",  ElemKind::FP4)
+      .value("I8",   ElemKind::I8)
+      .value("Unknown", ElemKind::Unknown)
+      .export_values();
+
+  // ── HardwareInfo ───────────────────────────────────────────────────────────
+  // All fields are precomputed at construction — expose as read-only
+  // properties to avoid copies on access.
+  py::class_<HardwareInfo>(m, "HardwareInfo")
+      .def_static("get", [](const std::string &archStr) {
+        return HardwareInfo::get(archStr);
+      }, py::arg("arch_str"),
+         "Construct HardwareInfo from an arch string (e.g. 'gfx942').")
+      .def_readonly("num_cus",          &HardwareInfo::numCUs)
+      .def_readonly("num_simd_per_cu",  &HardwareInfo::numSimdPerCU)
+      .def_readonly("wave_size",        &HardwareInfo::waveSize)
+      .def_readonly("vgpr_per_simd",    &HardwareInfo::vgprPerSimd)
+      .def_readonly("lds_per_cu",       &HardwareInfo::ldsPerCU)
+      .def_readonly("peak_mem_bw_bytes_per_cycle",
+                    &HardwareInfo::peakMemBwBytesPerCycle)
+      .def_readonly("clock_mhz",        &HardwareInfo::clockMHz);
+
+  // ── GemmProblem ────────────────────────────────────────────────────────────
+  py::class_<GemmProblem>(m, "GemmProblem")
+      .def(py::init<>())
+      .def(py::init([](int64_t M, int64_t N, int64_t K,
+                       ElemKind aKind, ElemKind bKind, ElemKind cKind,
+                       int aBits, int bBits, int cBits) {
+        GemmProblem p;
+        p.M = M; p.N = N; p.K = K;
+        p.aKind = aKind; p.bKind = bKind; p.cKind = cKind;
+        p.aBits = aBits; p.bBits = bBits; p.cBits = cBits;
+        return p;
+      }), py::arg("M"), py::arg("N"), py::arg("K"),
+          py::arg("a_kind") = ElemKind::FP16,
+          py::arg("b_kind") = ElemKind::FP16,
+          py::arg("c_kind") = ElemKind::FP32,
+          py::arg("a_bits") = 16,
+          py::arg("b_bits") = 16,
+          py::arg("c_bits") = 32)
+      .def_readwrite("M",      &GemmProblem::M)
+      .def_readwrite("N",      &GemmProblem::N)
+      .def_readwrite("K",      &GemmProblem::K)
+      .def_readwrite("a_kind", &GemmProblem::aKind)
+      .def_readwrite("b_kind", &GemmProblem::bKind)
+      .def_readwrite("c_kind", &GemmProblem::cKind)
+      .def_readwrite("a_bits", &GemmProblem::aBits)
+      .def_readwrite("b_bits", &GemmProblem::bBits)
+      .def_readwrite("c_bits", &GemmProblem::cBits);
+
+  // ── TritonGemmConfig ───────────────────────────────────────────────────────
+  py::class_<TritonGemmConfig>(m, "TritonGemmConfig")
+      .def(py::init<>())
+      .def_readwrite("block_m",        &TritonGemmConfig::blockM)
+      .def_readwrite("block_n",        &TritonGemmConfig::blockN)
+      .def_readwrite("block_k",        &TritonGemmConfig::blockK)
+      .def_readwrite("num_stages",     &TritonGemmConfig::numStages)
+      .def_readwrite("num_warps",      &TritonGemmConfig::numWarps)
+      .def_readwrite("mfma_non_k_dim", &TritonGemmConfig::mfmaNonKDim)
+      .def_readwrite("k_width",        &TritonGemmConfig::kWidth)
+      .def_readwrite("bypass_lds",     &TritonGemmConfig::bypassLds)
+      .def_readwrite("use_async_copy", &TritonGemmConfig::useAsyncCopy)
+      .def_readwrite("k_pack",         &TritonGemmConfig::kPack)
+      .def("__repr__", [](const TritonGemmConfig &c) {
+        return "TritonGemmConfig(block_m=" + std::to_string(c.blockM) +
+               ", block_n=" + std::to_string(c.blockN) +
+               ", block_k=" + std::to_string(c.blockK) +
+               ", num_warps=" + std::to_string(c.numWarps) +
+               ", num_stages=" + std::to_string(c.numStages) +
+               ", mfma_non_k_dim=" + std::to_string(c.mfmaNonKDim) + ")";
+      });
+
+  // ── PerfEstimate ───────────────────────────────────────────────────────────
+  // Read-only — it's a result struct returned by estimate_perf().
+  py::class_<PerfEstimate>(m, "PerfEstimate")
+      .def_readonly("predicted_tflops",    &PerfEstimate::predictedTflops)
+      .def_readonly("is_valid",            &PerfEstimate::isValid)
+      .def_readonly("is_compute_bound",    &PerfEstimate::isComputeBound)
+      .def_readonly("vgpr_count",          &PerfEstimate::vgprCount)
+      .def_readonly("lds_bytes",           &PerfEstimate::ldsBytes)
+      .def_readonly("occupancy",           &PerfEstimate::occupancy)
+      .def_readonly("arithmetic_intensity",&PerfEstimate::arithmeticIntensity)
+      .def_readonly("compute_cycles",      &PerfEstimate::computeCycles)
+      .def_readonly("memory_cycles",       &PerfEstimate::memoryCycles)
+      .def_readonly("pipeline_overlap",    &PerfEstimate::pipelineOverlap)
+      .def_readonly("wave_efficiency",     &PerfEstimate::waveEfficiency)
+      .def_readonly("lds_exceeded",        &PerfEstimate::ldsExceeded)
+      .def_readonly("likely_spills",       &PerfEstimate::likelySpills);
+
+  // ── Free functions ─────────────────────────────────────────────────────────
+  // generate_candidates: returns vector by value; pybind11 converts to list.
+  // topK=0 means return all ranked configs (uses stable_sort).
+  // topK>0 uses partial_sort — O(N log K) instead of O(N log N).
+  m.def("generate_candidates",
+        [](const GemmProblem &prob, const HardwareInfo &hw) {
+          return generateCandidates(prob, hw);
+        },
+        py::arg("prob"), py::arg("hw"),
+        "Generate all feasible TritonGemmConfig candidates for a GEMM "
+        "problem on the given hardware. All returned configs pass "
+        "isValidConfig (LDS fits, VGPR fits, kDim aligned).");
+
+  m.def("rank_configs",
+        [](const GemmProblem &prob,
+           const std::vector<TritonGemmConfig> &configs,
+           const HardwareInfo &hw,
+           size_t topK) {
+          return rankConfigs(prob, configs, hw, topK);
+        },
+        py::arg("prob"), py::arg("configs"), py::arg("hw"),
+        py::arg("top_k") = 0,
+        "Sort configs by predicted TFLOPS (best first). "
+        "LDS-overflowing configs are excluded. "
+        "top_k=0 returns all; top_k>0 uses partial_sort for O(N log K).");
+
+  m.def("estimate_perf",
+        [](const GemmProblem &prob, const TritonGemmConfig &cfg,
+           const HardwareInfo &hw) {
+          return estimatePerf(prob, cfg, hw);
+        },
+        py::arg("prob"), py::arg("cfg"), py::arg("hw"),
+        "Full analytical performance estimate (roofline + wave quantisation).");
+}
+
 void init_triton_amd(py::module &&m) {
   m.doc() = "Python bindings to the AMD Triton backend";
 
   auto passes = m.def_submodule("passes");
   init_triton_amd_passes_ttgpuir(passes.def_submodule("ttgpuir"));
+
+  init_triton_amd_perf_model(m.def_submodule("perf_model"));
 
   m.attr("TARGET_TRIPLE") = amdTargetTriple;
   m.attr("CALLING_CONV_AMDGPU_KERNEL") =
