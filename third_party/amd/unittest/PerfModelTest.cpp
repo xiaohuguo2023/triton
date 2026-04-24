@@ -167,20 +167,19 @@ TEST(RankConfigs, EmptyInputReturnsEmpty) {
   EXPECT_TRUE(result.empty());
 }
 
-TEST(RankConfigs, ValidConfigsRankedBeforeInvalidOnes) {
+TEST(RankConfigs, LdsOverflowConfigsAreExcluded) {
   TritonGemmConfig valid = standardConfig();
 
   // LDS-busting config: 32 stages balloons memory use past 64 KB limit.
-  TritonGemmConfig invalid = standardConfig();
-  invalid.numStages = 32;
+  // With the LDS pre-filter, this config is excluded from output entirely
+  // rather than placed last — avoids paying for the full roofline computation.
+  TritonGemmConfig ldsOverflow = standardConfig();
+  ldsOverflow.numStages = 32;
 
-  auto ranked = rankConfigs(fp16Problem(), {invalid, valid}, gfx942());
-  ASSERT_EQ(ranked.size(), 2u);
-  // The valid config must come first (invalid configs rank last).
-  auto estFirst = estimatePerf(fp16Problem(), ranked[0], gfx942());
-  auto estLast  = estimatePerf(fp16Problem(), ranked[1], gfx942());
-  EXPECT_TRUE(estFirst.isValid);
-  EXPECT_FALSE(estLast.isValid);
+  auto ranked = rankConfigs(fp16Problem(), {ldsOverflow, valid}, gfx942());
+  // Only the valid config survives the LDS pre-filter.
+  ASSERT_EQ(ranked.size(), 1u);
+  EXPECT_EQ(ranked[0].numStages, valid.numStages);
 }
 
 TEST(RankConfigs, HigherOccupancyConfigRanksHigher) {
@@ -206,7 +205,7 @@ TEST(RankConfigs, HigherOccupancyConfigRanksHigher) {
   }
 }
 
-TEST(RankConfigs, OutputPreservesAllConfigs) {
+TEST(RankConfigs, OutputPreservesAllValidConfigs) {
   std::vector<TritonGemmConfig> configs;
   for (int stages : {1, 2, 3}) {
     auto cfg = standardConfig();
@@ -215,6 +214,36 @@ TEST(RankConfigs, OutputPreservesAllConfigs) {
   }
   auto ranked = rankConfigs(fp16Problem(), configs, gfx942());
   EXPECT_EQ(ranked.size(), configs.size());
+}
+
+TEST(RankConfigs, TopKLimitsOutput) {
+  // With topK=1, only the single best config is returned.
+  std::vector<TritonGemmConfig> configs;
+  for (int stages : {1, 2, 3}) {
+    auto cfg = standardConfig();
+    cfg.numStages = stages;
+    configs.push_back(cfg);
+  }
+  auto top1 = rankConfigs(fp16Problem(), configs, gfx942(), /*topK=*/1);
+  ASSERT_EQ(top1.size(), 1u);
+
+  // The top-1 result must have TFLOPS >= all others.
+  auto allRanked = rankConfigs(fp16Problem(), configs, gfx942());
+  auto estTop1 = estimatePerf(fp16Problem(), top1[0], gfx942());
+  auto estBest = estimatePerf(fp16Problem(), allRanked[0], gfx942());
+  EXPECT_NEAR(estTop1.predictedTflops, estBest.predictedTflops, 1e-3);
+}
+
+TEST(RankConfigs, TopKLargerThanInputReturnsAll) {
+  std::vector<TritonGemmConfig> configs;
+  for (int stages : {1, 2}) {
+    auto cfg = standardConfig();
+    cfg.numStages = stages;
+    configs.push_back(cfg);
+  }
+  // topK=100 > 2 configs — should return all.
+  auto ranked = rankConfigs(fp16Problem(), configs, gfx942(), /*topK=*/100);
+  EXPECT_EQ(ranked.size(), 2u);
 }
 
 // ---------------------------------------------------------------------------

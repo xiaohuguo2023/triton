@@ -279,12 +279,20 @@ bool isValidConfig(const GemmProblem &prob, const TritonGemmConfig &cfg,
                    const HardwareInfo &hw);
 
 /// Sort a list of candidate configs by predicted throughput (best first).
-/// Invalid configs (isValidConfig == false) are pushed to the end.
+///
+/// Configs that exceed the LDS capacity are excluded from the output entirely
+/// (pre-filtered before the expensive roofline computation). Configs that fail
+/// other validity checks (VGPR, kDim alignment) are pushed to the end.
+///
+/// When topK > 0, only the top-K results are returned and std::partial_sort is
+/// used instead of std::stable_sort — O(N log K) vs O(N log N). Pass topK=0
+/// (default) to return all valid configs in ranked order.
+///
 /// Among equally-ranked configs, prefer higher arithmetic intensity, then
-/// larger blockM (stability of tie-breaking matches Origami's convention).
+/// larger blockM (matches Origami's tie-breaking convention).
 std::vector<TritonGemmConfig>
 rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
-            const HardwareInfo &hw);
+            const HardwareInfo &hw, size_t topK = 0);
 
 /// Analytically select the best MFMA mDim / nDim for a problem.
 ///
