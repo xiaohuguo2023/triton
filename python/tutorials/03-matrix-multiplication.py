@@ -533,10 +533,16 @@ if is_hip() and _HAS_PERF_MODEL:
     _b = torch.randn((_K, _N), device=DEVICE, dtype=torch.float16)
     _arch = current_amd_arch()
 
-    # ── PerfModel: measure selection time and show top-3 predictions ─────────
+    # ── PerfModel: measure ONLY config selection time (not kernel JIT) ───────
+    # pick_gemm_config = generateCandidates + rankConfigs (pure C++ model).
+    # matmul_model() includes kernel JIT compilation on first call (~200ms);
+    # we separate the two to show true selection overhead.
     _t0 = time.perf_counter()
-    _, _top3 = matmul_model(_a, _b, top_k=3)
+    _top3 = pick_gemm_config(_M, _N, _K, 'fp16', _arch, top_k=3)
     _select_ms = (time.perf_counter() - _t0) * 1e3
+
+    # Warm up the kernel (JIT compile) separately — not part of selection time
+    matmul_model(_a, _b, top_k=1)
 
     # Build GemmProblem for estimate_perf calls
     _hw   = _pm.HardwareInfo.get(_arch)
@@ -580,7 +586,7 @@ if is_hip() and _HAS_PERF_MODEL:
     print(f"  PerfModel : {_tflops(_ms_pm):.1f} TFLOPS"
           f"  ({100 * _tflops(_ms_pm) / _tflops(_ms_at):.1f}% of autotune)")
     print(f"\nSelection overhead:")
-    print(f"  PerfModel : {_select_ms:.2f} ms  (generate + rank ~900 candidates)")
+    print(f"  PerfModel : {_select_ms:.2f} ms  (generate ~{len(_top3)*50} candidates + rank top-3, pure C++ model)")
     print(f"  Autotune  : N × benchmark_time  ({len(get_hip_autotune_config())} configs)")
     print(f"{'='*60}\n")
 
