@@ -473,9 +473,8 @@ if _HAS_PERF_MODEL:
             a.stride(0), a.stride(1),
             b.stride(0), b.stride(1),
             c.stride(0), c.stride(1),
-            GROUP_SIZE_M=8,
             ACTIVATION=activation,
-            **kw,
+            **kw,  # includes GROUP_SIZE_M from selectGroupSizeM
         )
         return (c, cfgs) if top_k > 1 else c
 
