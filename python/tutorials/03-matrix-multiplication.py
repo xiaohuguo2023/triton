@@ -149,6 +149,7 @@ You will specifically learn about:
 # Final Result
 # ------------
 
+import time
 import torch
 
 import triton
@@ -159,6 +160,10 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
+
+
+def is_hip():
+    return triton.runtime.driver.active.get_current_target().backend == "hip"
 
 
 def get_cuda_autotune_config():
@@ -353,6 +358,129 @@ def matmul(a, b, activation=""):
 
 
 # %%
+# AMD PerfModel-driven kernel (no autotuning)
+# -------------------------------------------
+#
+# On AMD GPUs we provide a second kernel variant that uses the analytical
+# PerfModel to select a config *without benchmarking*.  The model generates
+# ~900 candidate configs, ranks them by predicted TFLOPS using a roofline +
+# wave-quantisation model (matching Origami's approach), and returns the
+# best config in microseconds.
+#
+# A ``top_k`` backdoor is available for diagnosis: if ``top_k > 1`` you can
+# inspect the model's full ranking and benchmark multiple predictions to
+# detect mispredictions.
+
+if is_hip():
+    try:
+        from triton.backends.amd.amd_gemm_selector import (
+            pick_gemm_config, config_to_kernel_kwargs, current_amd_arch,
+        )
+        from triton._C.libtriton.amd import perf_model as _pm
+        _HAS_PERF_MODEL = True
+    except ImportError:
+        _HAS_PERF_MODEL = False
+else:
+    _HAS_PERF_MODEL = False
+
+
+if _HAS_PERF_MODEL:
+    # Plain @triton.jit kernel — identical body to matmul_kernel but with
+    # matrix_instr_nonkdim as an explicit constexpr (set per-call by the
+    # selector, not by the autotuner config dict).
+    @triton.jit
+    def matmul_kernel_amd(
+            a_ptr, b_ptr, c_ptr,
+            M, N, K,
+            stride_am, stride_ak,
+            stride_bk, stride_bn,
+            stride_cm, stride_cn,
+            BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+            BLOCK_SIZE_K: tl.constexpr,
+            GROUP_SIZE_M: tl.constexpr,
+            matrix_instr_nonkdim: tl.constexpr,  # noqa: F841 (used by backend)
+            ACTIVATION: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+        tl.assume(stride_am > 0)
+        tl.assume(stride_ak > 0)
+        tl.assume(stride_bn > 0)
+        tl.assume(stride_bk > 0)
+        tl.assume(stride_cm > 0)
+        tl.assume(stride_cn > 0)
+
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            accumulator = tl.dot(a, b, accumulator)
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+        if ACTIVATION == "leaky_relu":
+            accumulator = leaky_relu(accumulator)
+        c = accumulator.to(tl.float16)
+
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, c, mask=c_mask)
+
+
+    def matmul_model(a, b, activation="", top_k=1):
+        """
+        AMD PerfModel-driven matmul.  Selects the best config analytically.
+
+        top_k=1  (default): use the model's top prediction directly.
+        top_k>1: return (output, ranked_configs) for inspection/comparison.
+        """
+        assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+        assert a.is_contiguous(), "Matrix A must be contiguous"
+        M, K = a.shape
+        K, N = b.shape
+        c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+
+        arch  = current_amd_arch()
+        dtype = "fp16" if a.dtype == torch.float16 else "bf16"
+        cfgs  = pick_gemm_config(M, N, K, dtype, arch, top_k=top_k)
+        if not cfgs:
+            raise RuntimeError(f"PerfModel found no valid config for {M}×{N}×{K} on {arch}")
+
+        cfg   = cfgs[0]
+        kw    = config_to_kernel_kwargs(cfg)
+        grid  = (triton.cdiv(M, cfg.block_m) * triton.cdiv(N, cfg.block_n),)
+
+        matmul_kernel_amd[grid](
+            a, b, c,
+            M, N, K,
+            a.stride(0), a.stride(1),
+            b.stride(0), b.stride(1),
+            c.stride(0), c.stride(1),
+            GROUP_SIZE_M=8,
+            ACTIVATION=activation,
+            **kw,
+        )
+        return (c, cfgs) if top_k > 1 else c
+
+
+# %%
 # Unit Test
 # ---------
 #
@@ -390,6 +518,74 @@ if TORCH_HAS_FP8 and is_cuda():
         print("❌ Triton and Torch differ")
 
 # %%
+# AMD: Autotune vs PerfModel comparison
+# --------------------------------------
+#
+# On AMD GPUs we compare:
+#   - Autotune: benchmark all hand-written configs, pick the fastest
+#   - PerfModel: pick config analytically in microseconds, no benchmarking
+#
+# The top_k backdoor prints the model's top-3 predictions so you can
+# inspect the ranking and detect mispredictions if PerfModel underperforms.
+
+if is_hip() and _HAS_PERF_MODEL:
+    _M, _N, _K = 4096, 4096, 4096
+    _a = torch.randn((_M, _K), device=DEVICE, dtype=torch.float16)
+    _b = torch.randn((_K, _N), device=DEVICE, dtype=torch.float16)
+    _arch = current_amd_arch()
+
+    # ── PerfModel: measure selection time and show top-3 predictions ─────────
+    _t0 = time.perf_counter()
+    _, _top3 = matmul_model(_a, _b, top_k=3)
+    _select_ms = (time.perf_counter() - _t0) * 1e3
+
+    # Build GemmProblem for estimate_perf calls
+    _hw   = _pm.HardwareInfo.get(_arch)
+    _prob = _pm.GemmProblem(_M, _N, _K,
+                            _pm.ElemKind.FP16, _pm.ElemKind.FP16, _pm.ElemKind.FP32,
+                            16, 16, 32)
+
+    print(f"\n{'='*60}")
+    print(f"AMD Config Selection: Autotune vs PerfModel")
+    print(f"Problem: {_M}×{_N}×{_K}  FP16  arch={_arch}")
+    print(f"{'='*60}")
+
+    print(f"\nPerfModel top-3 predictions (selection took {_select_ms:.2f} ms):")
+    for i, cfg in enumerate(_top3):
+        est = _pm.estimate_perf(_prob, cfg, _hw)
+        print(f"  #{i+1}: BLOCK_M={cfg.block_m:3d}  BLOCK_N={cfg.block_n:3d}"
+              f"  BLOCK_K={cfg.block_k:3d}  num_warps={cfg.num_warps}"
+              f"  num_stages={cfg.num_stages}  mfma={cfg.mfma_non_k_dim}"
+              f"  → predicted {est.predicted_tflops:.1f} TFLOPS"
+              f"  ({'compute' if est.is_compute_bound else 'memory'}-bound)")
+
+    # ── Autotune: warm up to force config selection, then report winner ───────
+    _ = matmul(_a, _b)  # triggers autotuning
+    if hasattr(matmul_kernel, 'best_config'):
+        _bc = matmul_kernel.best_config
+        print(f"\nAutotune selected (after benchmarking {len(get_hip_autotune_config())} configs):")
+        print(f"  BLOCK_M={_bc.kwargs.get('BLOCK_SIZE_M')}  "
+              f"BLOCK_N={_bc.kwargs.get('BLOCK_SIZE_N')}  "
+              f"BLOCK_K={_bc.kwargs.get('BLOCK_SIZE_K')}  "
+              f"num_warps={_bc.num_warps}  num_stages={_bc.num_stages}  "
+              f"mfma={_bc.kwargs.get('matrix_instr_nonkdim')}")
+
+    # ── Performance comparison ────────────────────────────────────────────────
+    _quantiles = [0.5, 0.2, 0.8]
+    _ms_at,  _, _ = triton.testing.do_bench(lambda: matmul(_a, _b),       quantiles=_quantiles)
+    _ms_pm,  _, _ = triton.testing.do_bench(lambda: matmul_model(_a, _b), quantiles=_quantiles)
+    _tflops        = lambda ms: 2 * _M * _N * _K * 1e-12 / (ms * 1e-3)
+
+    print(f"\nPerformance ({_M}×{_N}×{_K} FP16):")
+    print(f"  Autotune  : {_tflops(_ms_at):.1f} TFLOPS")
+    print(f"  PerfModel : {_tflops(_ms_pm):.1f} TFLOPS"
+          f"  ({100 * _tflops(_ms_pm) / _tflops(_ms_at):.1f}% of autotune)")
+    print(f"\nSelection overhead:")
+    print(f"  PerfModel : {_select_ms:.2f} ms  (generate + rank ~900 candidates)")
+    print(f"  Autotune  : N × benchmark_time  ({len(get_hip_autotune_config())} configs)")
+    print(f"{'='*60}\n")
+
+# %%
 # Benchmark
 # ---------
 #
@@ -405,19 +601,25 @@ configs = []
 for fp8_inputs in [False, True]:
     if fp8_inputs and (not TORCH_HAS_FP8 or not is_cuda()):
         continue
+    if is_hip() and _HAS_PERF_MODEL and not fp8_inputs:
+        # AMD: three-way comparison — rocBLAS, Autotune, PerfModel
+        _line_vals  = [ref_lib.lower(), "triton", "perf_model"]
+        _line_names = [ref_lib, "Triton (Autotune)", "Triton (PerfModel)"]
+        _styles     = [("green", "-"), ("blue", "-"), ("red", "--")]
+    else:
+        _line_vals  = ["triton"] if fp8_inputs else [ref_lib.lower(), "triton"]
+        _line_names = ["Triton"] if fp8_inputs else [ref_lib, "Triton"]
+        _styles     = [("green", "-"), ("blue", "-")]
     configs.append(
         triton.testing.Benchmark(
-            x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
-            x_vals=[128 * i for i in range(2, 33)],  # Different possible values for `x_name`
-            line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
-            # Possible values for `line_arg`
-            # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
-            line_vals=["triton"] if fp8_inputs else [ref_lib.lower(), "triton"],  # Label name for the lines
-            line_names=["Triton"] if fp8_inputs else [ref_lib, "Triton"],  # Line styles
-            styles=[("green", "-"), ("blue", "-")],
-            ylabel="TFLOPS",  # Label name for the y-axis
-            plot_name="matmul-performance-" +
-            ("fp16" if not fp8_inputs else "fp8"),  # Name for the plot, used also as a file name for saving the plot.
+            x_names=["M", "N", "K"],
+            x_vals=[128 * i for i in range(2, 33)],
+            line_arg="provider",
+            line_vals=_line_vals,
+            line_names=_line_names,
+            styles=_styles,
+            ylabel="TFLOPS",
+            plot_name="matmul-performance-" + ("fp16" if not fp8_inputs else "fp8"),
             args={"fp8_inputs": fp8_inputs},
         ))
 
@@ -435,6 +637,8 @@ def benchmark(M, N, K, provider, fp8_inputs):
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles)
     if provider == 'triton':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles)
+    if provider == 'perf_model' and _HAS_PERF_MODEL:
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_model(a, b), quantiles=quantiles)
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
