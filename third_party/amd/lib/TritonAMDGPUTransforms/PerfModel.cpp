@@ -798,6 +798,14 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   est.ctasPerCU = wavesPerCU / std::max(1, cfg.numWarps);
   est.occupancy = static_cast<double>(wavesPerCU) / maxWavesPerCU;
 
+  // For the occupancy penalty in the roofline, use VGPR-limited occupancy only.
+  // LDS-limited occupancy (from larger pipeline buffers) should not be penalised:
+  // more LDS per CTA improves compute-memory overlap rather than hurting throughput.
+  // This allows the BK tiebreak to correctly prefer BK=64 over BK=32 even when
+  // BK=64 uses more LDS (lower LDS occupancy) but achieves the same pipeline depth.
+  const double vgprOccupancy =
+      static_cast<double>(std::min(wavesFromVgpr, maxWavesPerCU)) / maxWavesPerCU;
+
   // ── Step 2: Wave quantisation ─────────────────────────────────────────────
 
   auto ceildiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
@@ -950,11 +958,13 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // regardless of how many other waves are resident.
   //
   // Occupancy penalty: for compute-bound kernels, no penalty (MFMA saturated).
-  // For memory-bound kernels, low occupancy limits latency hiding.
+  // For memory-bound kernels, use VGPR-only occupancy (vgprOccupancy) rather
+  // than the combined est.occupancy. LDS-limited occupancy reflects larger
+  // pipeline buffers — beneficial for overlap, not a performance constraint.
   // Cap at 2× (min effective occupancy = 0.5) to avoid over-penalising.
   double occupancyPenalty = est.isComputeBound
                                 ? 1.0
-                                : (1.0 / std::max(est.occupancy, 0.5));
+                                : (1.0 / std::max(vgprOccupancy, 0.5));
 
   double totalCycles = est.effectiveTileCycles * est.numWaves * occupancyPenalty;
   // Apply wave-tail efficiency.
@@ -1105,13 +1115,16 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
                                    prob.aKind, prob.cKind))
     mfmaKDim = info->kDim;
 
-  // blockK candidates: 1×, 2×, 4×, 8× the MFMA kDim, capped at 256.
-  // Larger blockK improves arithmetic intensity but inflates LDS.
+  // blockK candidates: 1×, 2×, 4× the MFMA kDim.
+  // Cap at 4×kDim: from empirical calibration (testtmp/calibrate_l2_bw.py),
+  // BK=8×kDim (=256 for gfx950) is fastest for M≤1024 (fits in L2) but
+  // drops for M≥2048 when the working set exceeds L2 per XCD. Since we
+  // don't yet model this M-dependent L2 capacity constraint, conservatively
+  // cap at 4×kDim (=128 for gfx950) which performs well across all M.
   const int blockKCandidates[] = {
       mfmaKDim,
       mfmaKDim * 2,
       mfmaKDim * 4,
-      mfmaKDim * 8,
   };
 
   // Step 3: generate (blockM, blockN) pairs using Origami's wave-based formula:
