@@ -836,17 +836,28 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // than a large BLOCK_K despite lower per-iteration cost.  This matches
   // Origami's num_iter term in compute_total_latency().
   //
-  //   numKIter          = ceil(K / BLOCK_K)
+  //   numKIter          = K / BLOCK_K  (exact, not ceiling)
   //   numMfmaPerKBlock  = (BLOCK_M/mDim) * (BLOCK_N/nDim) * (BLOCK_K/kDim)
   //   computeCycles     = numMfmaPerKBlock * numKIter * throughputCycles
   //                       / numSimdPerCU
+  //
+  // We use exact (floating-point) K/BLOCK_K rather than ceil(K/BLOCK_K) for
+  // numKIter. When K is not divisible by BLOCK_K (e.g. K=2880, BK=128),
+  // ceil gives 23 but the effective work is 22.5 iterations. Using ceil
+  // unfairly penalises larger BK values in ranking: BK=128 appears to do
+  // 23/22.5 = 2.2% more work than BK=64 (45 exact iterations), making the
+  // model prefer BK=64. With exact division both configurations perform the
+  // same total work and rank equally, so the BK tiebreak correctly selects
+  // the larger value. (Triton itself runs ceil iterations with K-masking for
+  // the partial last block — this is a ranking approximation, not a correctness
+  // issue.)
 
   int mDim = cfg.mfmaNonKDim > 0
                  ? cfg.mfmaNonKDim
                  : selectMfmaNonKDim(prob, cfg, hw);
 
-  const int64_t numKIter =
-      (cfg.blockK > 0) ? ceildiv(prob.K, cfg.blockK) : 1;
+  const double numKIter =
+      (cfg.blockK > 0) ? static_cast<double>(prob.K) / cfg.blockK : 1.0;
 
   auto infoOpt = getMfmaInstrInfo(hw.arch, mDim, mDim, prob.aKind, prob.cKind);
   if (!infoOpt) {
@@ -860,8 +871,8 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
         ceildiv(cfg.blockN, info.nDim) *
         ceildiv(cfg.blockK, info.kDim);
     est.computeCycles =
-        static_cast<double>(numMfmaPerKBlock * numKIter * info.throughputCycles)
-        / hw.numSimdPerCU;
+        static_cast<double>(numMfmaPerKBlock) * numKIter
+        * info.throughputCycles / hw.numSimdPerCU;
   } else {
     // Fallback: full GEMM FLOPs for this output tile.
     est.computeCycles =
@@ -877,7 +888,7 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   double tileBytesABperK =
       static_cast<double>(cfg.blockM * cfg.blockK * aBytes +
                           cfg.blockN * cfg.blockK * bBytes);
-  // Total A/B traffic: numKIter fetches of the K-block.
+  // Total A/B traffic: numKIter fetches of the K-block (exact, not ceil).
   double tileBytesAB = tileBytesABperK * numKIter;
   double tileBytesC  = static_cast<double>(cfg.blockM * cfg.blockN * cBytes);
   double tileBytesTotal = tileBytesAB + tileBytesC;
