@@ -1068,7 +1068,19 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
   //  1. arithmetic intensity (larger tile → better cache reuse)
   //  2. blockK (larger → fewer K-loop iterations, better pipeline fill)
   //  3. numWarps (larger → enables pingpong scheduling on CDNA3/4)
-  //  4. blockM (Origami convention)
+  //  4. tile aspect ratio (BN/BM closest to N/M for asymmetric shapes)
+  //  5. blockM (Origami convention, final tie-break)
+  //
+  // Tiebreak 4 rationale: for asymmetric problems where N ≠ M, the tile
+  // orientation that matches the problem aspect ratio (BN/BM ≈ N/M) provides
+  // better L2 spatial reuse. Example: M=4096, N=5120 (N/M=1.25) — the tuned
+  // config uses BM=128×BN=256 (ratio=2.0, closer to 1.25 in log-space) while
+  // the symmetric blockM tiebreak incorrectly picks BM=256×BN=128 (ratio=0.5).
+  const double problemRatioLog =
+      (prob.M > 0 && prob.N > 0)
+          ? std::log(static_cast<double>(prob.N) / prob.M)
+          : 0.0;
+
   auto cmp = [&](const ScoredIdx &a, const ScoredIdx &b) {
     if (a.est.isValid != b.est.isValid)
       return a.est.isValid > b.est.isValid;
@@ -1081,9 +1093,26 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
     if (configs[a.idx].numWarps != configs[b.idx].numWarps)
       return configs[a.idx].numWarps > configs[b.idx].numWarps;
     // Prefer fewer stages: simpler pipeline with less LDS/VGPR pressure.
-    // Autotune consistently picks nS=2 on gfx950; nS=3 rarely wins in practice.
     if (configs[a.idx].numStages != configs[b.idx].numStages)
       return configs[a.idx].numStages < configs[b.idx].numStages;
+    // Prefer tile aspect ratio (BN/BM) closest to problem aspect ratio (N/M).
+    // Only applies when tile shapes differ (to avoid affecting symmetric cases).
+    {
+      const auto &ca = configs[a.idx];
+      const auto &cb = configs[b.idx];
+      if (ca.blockM != cb.blockM || ca.blockN != cb.blockN) {
+        double ratioA = (ca.blockM > 0)
+                            ? std::log(static_cast<double>(ca.blockN) / ca.blockM)
+                            : 0.0;
+        double ratioB = (cb.blockM > 0)
+                            ? std::log(static_cast<double>(cb.blockN) / cb.blockM)
+                            : 0.0;
+        double diffA = std::abs(ratioA - problemRatioLog);
+        double diffB = std::abs(ratioB - problemRatioLog);
+        if (std::abs(diffA - diffB) > 0.05) // tolerance: ~5% ratio difference
+          return diffA < diffB;
+      }
+    }
     return configs[a.idx].blockM > configs[b.idx].blockM;
   };
 
