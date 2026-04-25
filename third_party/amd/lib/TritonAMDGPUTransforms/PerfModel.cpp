@@ -724,20 +724,33 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   est.effectiveTileCycles =
       std::max(est.computeCycles, est.memoryCycles - hiddenMemCycles);
 
-  est.isComputeBound = (est.computeCycles >= est.memoryCycles);
+  // isComputeBound based on EFFECTIVE cycles (after pipeline overlap), not raw.
+  // A kernel pipelined enough to hide memory latency is compute-bound even if
+  // raw memoryCycles > computeCycles.
+  est.isComputeBound = (est.effectiveTileCycles <= est.computeCycles * 1.05);
 
   // ── Step 5: Predicted throughput ──────────────────────────────────────────
+  //
+  // Total cycles = effectiveTileCycles × numWaves / waveEfficiency
+  //
+  // Occupancy penalty: low occupancy limits the GPU's ability to hide
+  // instruction-level and memory latency with other wavefronts.  However,
+  // when the kernel is compute-bound (MFMA pipeline is the bottleneck),
+  // occupancy does not limit throughput — the MFMA units are saturated
+  // regardless of how many other waves are resident.
+  //
+  // For memory-bound kernels we apply a moderate occupancy penalty capped at
+  // 2× (i.e., minimum effective occupancy = 0.5) to avoid over-penalising
+  // configs with slightly low occupancy.
+  double occupancyPenalty = est.isComputeBound
+                                ? 1.0
+                                : (1.0 / std::max(est.occupancy, 0.5));
 
-  // Total cycles for the whole GEMM:
-  //   effectiveTileCycles × numWaves  (wave quantisation)
-  // scaled by occupancy inefficiency.
-  double totalCycles =
-      est.effectiveTileCycles * est.numWaves / std::max(1e-6, est.occupancy);
+  double totalCycles = est.effectiveTileCycles * est.numWaves * occupancyPenalty;
   // Apply wave-tail efficiency.
   totalCycles /= std::max(1e-6, est.waveEfficiency);
 
-  double totalFlops =
-      2.0 * prob.M * prob.N * prob.K * prob.batchSize;
+  double totalFlops = 2.0 * prob.M * prob.N * prob.K * prob.batchSize;
 
   // TFLOPS = totalFlops / (totalCycles / clockMHz * 1e6) / 1e12
   if (totalCycles > 0.0 && hw.clockMHz > 0.0) {
@@ -745,10 +758,11 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
     est.predictedTflops = totalFlops / totalSeconds / 1e12;
   }
 
-  // Arithmetic intensity (compute / memory roof of the roofline).
+  // Arithmetic intensity: FLOPs per byte of A+B traffic (per K-block, consistent
+  // with the numerator using cfg.blockK rather than prob.K).
   est.arithmeticIntensity =
-      (tileBytesTotal > 0.0)
-          ? (2.0 * cfg.blockM * cfg.blockN * cfg.blockK) / tileBytesTotal
+      (tileBytesABperK > 0.0)
+          ? (2.0 * cfg.blockM * cfg.blockN * cfg.blockK) / tileBytesABperK
           : 0.0;
 
   // ── Validity ──────────────────────────────────────────────────────────────
@@ -819,8 +833,11 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
     scored.push_back({i, estimatePerf(prob, cfg, hw)});
   }
 
-  // Comparator: higher TFLOPS first; tie-break by arithmetic intensity then
-  // blockM (matches Origami's convention).
+  // Comparator: higher TFLOPS first; tie-break sequence:
+  //  1. arithmetic intensity (larger tile → better cache reuse)
+  //  2. blockK (larger → fewer K-loop iterations, better pipeline fill)
+  //  3. numWarps (larger → enables pingpong scheduling on CDNA3/4)
+  //  4. blockM (Origami convention)
   auto cmp = [&](const ScoredIdx &a, const ScoredIdx &b) {
     if (a.est.isValid != b.est.isValid)
       return a.est.isValid > b.est.isValid;
@@ -828,6 +845,10 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
       return a.est.predictedTflops > b.est.predictedTflops;
     if (std::abs(a.est.arithmeticIntensity - b.est.arithmeticIntensity) > 1e-3)
       return a.est.arithmeticIntensity > b.est.arithmeticIntensity;
+    if (configs[a.idx].blockK != configs[b.idx].blockK)
+      return configs[a.idx].blockK > configs[b.idx].blockK;
+    if (configs[a.idx].numWarps != configs[b.idx].numWarps)
+      return configs[a.idx].numWarps > configs[b.idx].numWarps;
     return configs[a.idx].blockM > configs[b.idx].blockM;
   };
 
@@ -909,8 +930,13 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
   mnPairs.erase(std::unique(mnPairs.begin(), mnPairs.end()), mnPairs.end());
 
   // Step 4: sweep numWarps and numStages.
-  const int numWarpsCandidates[]  = {1, 2, 4, 8};
-  const int numStagesCandidates[] = {1, 2, 3, 4};
+  // On CDNA4 (gfx950), Triton AMD GEMM kernels use num_warps=8 exclusively:
+  // the pingpong scheduler splits 8 warps into compute and memory clusters.
+  // Using fewer warps disables pingpong and misses the key gfx950 optimization.
+  // For CDNA1-3 and RDNA we sweep the full range.
+  const bool cdna4Only = (hw.arch == Arch::CDNA4);
+  const int numWarpsCandidates[]  = {4, 8};   // 4 kept as fallback
+  const int numStagesCandidates[] = {1, 2, 3}; // 4 stages rarely fits on gfx950
 
   // Step 5: enumerate all combinations and keep feasible ones.
   // Reserve the theoretical upper bound to avoid reallocation.
@@ -923,6 +949,8 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
       if (bK > 256)
         continue;
       for (int nW : numWarpsCandidates) {
+        if (cdna4Only && nW != 8) // gfx950 requires nW=8 for pingpong
+          continue;
         for (int nS : numStagesCandidates) {
           TritonGemmConfig cfg;
           cfg.blockM      = bM;
