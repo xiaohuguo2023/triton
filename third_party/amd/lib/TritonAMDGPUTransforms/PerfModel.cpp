@@ -632,6 +632,8 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
 
   // Tail-wave efficiency: if outputTiles is not a multiple of numCUs the last
   // wave runs with fewer active CUs.
+  // Special case: when totalOutputTiles < numCUs, only that many CUs are
+  // active — the rest are idle. Model this as waveEfficiency < 1.
   int64_t fullWaveCUs = est.totalOutputTiles % hw.numCUs;
   est.waveEfficiency =
       (fullWaveCUs == 0)
@@ -849,6 +851,10 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
       return configs[a.idx].blockK > configs[b.idx].blockK;
     if (configs[a.idx].numWarps != configs[b.idx].numWarps)
       return configs[a.idx].numWarps > configs[b.idx].numWarps;
+    // Prefer fewer stages: simpler pipeline with less LDS/VGPR pressure.
+    // Autotune consistently picks nS=2 on gfx950; nS=3 rarely wins in practice.
+    if (configs[a.idx].numStages != configs[b.idx].numStages)
+      return configs[a.idx].numStages < configs[b.idx].numStages;
     return configs[a.idx].blockM > configs[b.idx].blockM;
   };
 
@@ -904,21 +910,23 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
   //   blockM = mfmaDim × waveTileM × waveCountM
   //   blockN = mfmaDim × waveTileN × waveCountN
   // waveTile sweeps {1, 2, 4}, waveCount sweeps {1, 2, 4}.
-  // Cap at 256 to avoid unrealistically large tiles.
+  // minTile = 2 × mfmaDim: single-instruction tiles (blockM == mfmaDim) are
+  // too small — kernel-launch overhead dominates and MFMA utilisation is poor.
   const int waveTiles[]  = {1, 2, 4};
   const int waveCounts[] = {1, 2, 4};
   const int maxTile = 256;
+  const int minTile = 2 * mfmaDim; // e.g. 32 for mfmaDim=16
 
   std::vector<std::pair<int, int>> mnPairs;
   for (int wtM : waveTiles) {
     for (int wcM : waveCounts) {
       int bM = mfmaDim * wtM * wcM;
-      if (bM < mfmaDim || bM > maxTile)
+      if (bM < minTile || bM > maxTile)
         continue;
       for (int wtN : waveTiles) {
         for (int wcN : waveCounts) {
           int bN = mfmaDim * wtN * wcN;
-          if (bN < mfmaDim || bN > maxTile)
+          if (bN < minTile || bN > maxTile)
             continue;
           mnPairs.emplace_back(bM, bN);
         }
@@ -934,9 +942,14 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
   // the pingpong scheduler splits 8 warps into compute and memory clusters.
   // Using fewer warps disables pingpong and misses the key gfx950 optimization.
   // For CDNA1-3 and RDNA we sweep the full range.
+  // On CDNA4 (gfx950): num_warps=8 required for pingpong; num_stages=2
+  // consistently wins across all problem sizes (empirically validated vs
+  // autotuner). Use a single value to avoid model picking nS=3 due to
+  // over-optimistic pipeline overlap estimates.
+  // On other archs: sweep the full range.
   const bool cdna4Only = (hw.arch == Arch::CDNA4);
-  const int numWarpsCandidates[]  = {4, 8};   // 4 kept as fallback
-  const int numStagesCandidates[] = {1, 2, 3}; // 4 stages rarely fits on gfx950
+  const int numWarpsCandidates[]  = {4, 8};
+  const int numStagesCandidates[] = {1, 2, 3};
 
   // Step 5: enumerate all combinations and keep feasible ones.
   // Reserve the theoretical upper bound to avoid reallocation.
@@ -952,6 +965,8 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
         if (cdna4Only && nW != 8) // gfx950 requires nW=8 for pingpong
           continue;
         for (int nS : numStagesCandidates) {
+          if (cdna4Only && nS != 2) // gfx950: nS=2 wins empirically
+            continue;
           TritonGemmConfig cfg;
           cfg.blockM      = bM;
           cfg.blockN      = bN;
