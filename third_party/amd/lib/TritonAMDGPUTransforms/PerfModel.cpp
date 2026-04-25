@@ -112,7 +112,7 @@ HardwareInfo HardwareInfo::get(Arch arch) {
     hw.numXCDs = 1;
     hw.clockMHz = 1500.0;
     hw.peakMemBwBytesPerCycle = 800.0;
-    hw.peakL2BwBytesPerCycle = 6000.0;  // ~9 TB/s L2 / 1.5 GHz
+    hw.peakL2BwBytesPerCycle = 0.0;  // TODO: calibrate
     break;
 
   // ── CDNA2  gfx90a  MI200 (MI210 / MI250) ────────────────────────────────
@@ -129,7 +129,7 @@ HardwareInfo HardwareInfo::get(Arch arch) {
     hw.numXCDs = 2;              // MI250X is 2-die; MI210 is 1-die (conservative)
     hw.clockMHz = 1700.0;
     hw.peakMemBwBytesPerCycle = 941.0;
-    hw.peakL2BwBytesPerCycle = 8000.0;  // ~13.6 TB/s L2 / 1.7 GHz
+    hw.peakL2BwBytesPerCycle = 0.0;  // TODO: calibrate
     break;
 
   // ── CDNA3  gfx940/941/942  MI300 ────────────────────────────────────────
@@ -148,7 +148,7 @@ HardwareInfo HardwareInfo::get(Arch arch) {
     hw.numXCDs = 8;
     hw.clockMHz = 2100.0;
     hw.peakMemBwBytesPerCycle = 2524.0;
-    hw.peakL2BwBytesPerCycle = 20000.0; // ~42 TB/s L2 / 2.1 GHz
+    hw.peakL2BwBytesPerCycle = 0.0;  // TODO: calibrate
     break;
 
   // ── CDNA4  gfx950  MI350 (MI355X) ──────────────────────────────────────
@@ -167,7 +167,11 @@ HardwareInfo HardwareInfo::get(Arch arch) {
     hw.numXCDs = 8;              // Origami: get_default_num_xcds(gfx950) = 8
     hw.clockMHz = 2400.0;
     hw.peakMemBwBytesPerCycle = 3000.0;  // ~7.2 TB/s / 2.4 GHz
-    hw.peakL2BwBytesPerCycle = 20000.0;  // ~48 TB/s L2 / 2.4 GHz (estimated)
+    // Calibrated value from testtmp/calibrate_l2_bw.py: ~17900 bytes/cycle
+    // (peak effective BW ~43 TB/s observed at M=2048 BK=128 on MI355X).
+    // Set to 0 until BK candidate capping is implemented to prevent the L2
+    // model from over-preferring large BK at problem sizes where it hurts.
+    hw.peakL2BwBytesPerCycle = 0.0;  // re-enable after BK cap fix
     break;
 
   // ── RDNA3  gfx1100/1101/1102 ────────────────────────────────────────────
@@ -886,14 +890,21 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   }
 
   // Effective bandwidth: DRAM for misses, L2 for hits.
-  // bwPerCU is the per-CU share; L2 bandwidth >> DRAM bandwidth.
+  // When peakL2BwBytesPerCycle == 0 (uncalibrated), L2 hits are treated as
+  // free (served at DRAM bandwidth) — equivalent to disabling the L2 model.
+  // Set peakL2BwBytesPerCycle after calibration to enable accurate L2 reuse.
   const double dramBwPerCU = hw.peakMemBwBytesPerCycle / std::max(hw.numCUs, 1);
-  const double l2BwPerCU   = hw.peakL2BwBytesPerCycle  / std::max(hw.numCUs, 1);
-  const double dramTraffic = tileBytesAB * (1.0 - l2HitRate);
-  const double l2Traffic   = tileBytesAB * l2HitRate;
-  const double memCycles =
-      (dramBwPerCU > 0.0 ? dramTraffic / dramBwPerCU : 0.0) +
-      (l2BwPerCU   > 0.0 ? l2Traffic   / l2BwPerCU   : 0.0);
+  double memCycles;
+  if (hw.peakL2BwBytesPerCycle > 0.0) {
+    const double l2BwPerCU   = hw.peakL2BwBytesPerCycle / std::max(hw.numCUs, 1);
+    const double dramTraffic = tileBytesAB * (1.0 - l2HitRate);
+    const double l2Traffic   = tileBytesAB * l2HitRate;
+    memCycles = (dramBwPerCU > 0.0 ? dramTraffic / dramBwPerCU : 0.0) +
+                (l2BwPerCU   > 0.0 ? l2Traffic   / l2BwPerCU   : 0.0);
+  } else {
+    // Uncalibrated: use DRAM bandwidth for all traffic (conservative baseline).
+    memCycles = (dramBwPerCU > 0.0) ? tileBytesAB / dramBwPerCU : 0.0;
+  }
   est.memoryCycles = memCycles;
 
   // ── Step 4: Software-pipeline overlap ─────────────────────────────────────
