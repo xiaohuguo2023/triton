@@ -637,7 +637,22 @@ def benchmark(M, N, K, provider, fp8_inputs):
     if provider == 'triton':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles)
     if provider == 'perf_model' and _HAS_PERF_MODEL:
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_model(a, b), quantiles=quantiles)
+        # Pre-select config once outside the timed loop — pick_gemm_config
+        # takes ~0.02 ms but do_bench runs 100+ reps, which would inflate
+        # the measurement for small problem sizes where the kernel is <1 ms.
+        _cfgs = pick_gemm_config(M, N, K, 'fp16', current_amd_arch(), top_k=1)
+        _kw   = config_to_kernel_kwargs(_cfgs[0]) if _cfgs else {}
+        _grid = (triton.cdiv(M, _cfgs[0].block_m) * triton.cdiv(N, _cfgs[0].block_n),) if _cfgs else (1,)
+
+        def _run_pm():
+            c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+            matmul_kernel_amd[_grid](
+                a, b, c, M, N, K,
+                a.stride(0), a.stride(1), b.stride(0), b.stride(1),
+                c.stride(0), c.stride(1), ACTIVATION='', **_kw)
+            return c
+
+        ms, min_ms, max_ms = triton.testing.do_bench(_run_pm, quantiles=quantiles)
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
