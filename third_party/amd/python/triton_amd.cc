@@ -418,6 +418,7 @@ void init_triton_amd_perf_model(py::module &&m) {
       .def_readwrite("bypass_lds",     &TritonGemmConfig::bypassLds)
       .def_readwrite("use_async_copy", &TritonGemmConfig::useAsyncCopy)
       .def_readwrite("k_pack",         &TritonGemmConfig::kPack)
+      .def_readwrite("group_size_m",   &TritonGemmConfig::groupSizeM)
       .def("__repr__", [](const TritonGemmConfig &c) {
         return "TritonGemmConfig(block_m=" + std::to_string(c.blockM) +
                ", block_n=" + std::to_string(c.blockN) +
@@ -477,6 +478,14 @@ void init_triton_amd_perf_model(py::module &&m) {
         },
         py::arg("prob"), py::arg("cfg"), py::arg("hw"),
         "Full analytical performance estimate (roofline + wave quantisation).");
+
+  m.def("select_group_size_m",
+        [](const GemmProblem &prob, const TritonGemmConfig &cfg,
+           const HardwareInfo &hw) {
+          return selectGroupSizeM(prob, cfg, hw);
+        },
+        py::arg("prob"), py::arg("cfg"), py::arg("hw"),
+        "Select GROUP_SIZE_M using Origami's WGM prediction algorithm.");
 }
 
 void init_triton_amd(py::module &&m) {

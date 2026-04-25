@@ -67,13 +67,17 @@ struct HardwareInfo {
 
   // ── Memory hierarchy ─────────────────────────────────────────────────────
   int ldsPerCU = 65536;    ///< LDS (shared memory) bytes per CU
-  int l2SizeBytes = 0;     ///< L2 cache size in bytes  (device-wide)
+  int l2SizeBytes = 0;     ///< L2 cache size per XCD in bytes
   int mallSizeBytes = 0;   ///< Infinity Cache / MALL size in bytes (0 = none)
+  int numXCDs = 1;         ///< Number of XCDs (chiplets); 1 for monolithic dies
 
   // ── Bandwidth / clocks ────────────────────────────────────────────────────
   /// Peak global memory bandwidth in bytes per clock cycle
   /// (= peak_BW_GBps / clockMHz * 1000).
   double peakMemBwBytesPerCycle = 0.0;
+  /// Peak L2 bandwidth in bytes per clock cycle (device-wide).
+  /// Much higher than DRAM; used to compute effective bandwidth with L2 hits.
+  double peakL2BwBytesPerCycle = 0.0;
   double clockMHz = 0.0;   ///< Typical boost clock in MHz
 
   // ── Derived helpers ───────────────────────────────────────────────────────
@@ -187,6 +191,7 @@ struct TritonGemmConfig {
   bool useAsyncCopy = true; ///< True if global→LDS copies are async
   int wavesPerEu = 0;       ///< Requested waves per EU hint (0 = unset)
   int kPack = 1;            ///< LDS vector multiplier (1 or 2; pass option kPack)
+  int groupSizeM = 8;       ///< Tile scheduling slab width (Triton GROUP_SIZE_M)
 };
 
 //===----------------------------------------------------------------------===//
@@ -293,6 +298,16 @@ bool isValidConfig(const GemmProblem &prob, const TritonGemmConfig &cfg,
 std::vector<TritonGemmConfig>
 rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
             const HardwareInfo &hw, size_t topK = 0);
+
+/// Select the optimal GROUP_SIZE_M (tile scheduling slab width) using
+/// Origami's predict_workgroup_mapping algorithm: iterate over candidates
+/// {1,4,6} ∪ divisors(wgm_cap), evaluate L2 working-set cost for the last
+/// XCD in the first timestep, return the candidate with minimum cost.
+///
+/// This is equivalent to Origami's `predict_workgroup_mapping` and controls
+/// the same parameter as Triton's GROUP_SIZE_M in the matmul kernel.
+int selectGroupSizeM(const GemmProblem &prob, const TritonGemmConfig &cfg,
+                     const HardwareInfo &hw);
 
 /// Analytically select the best MFMA mDim / nDim for a problem.
 ///

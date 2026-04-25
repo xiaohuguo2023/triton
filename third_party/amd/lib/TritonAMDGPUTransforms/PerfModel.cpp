@@ -106,12 +106,13 @@ HardwareInfo HardwareInfo::get(Arch arch) {
     hw.vgprPerSimd = 256;
     hw.vgprAllocGranule = 4;
     hw.maxWavesPerSimd = 10;
-    hw.ldsPerCU = 65536;        // 64 KB
-    hw.l2SizeBytes = 8 << 20;   // 8 MB
+    hw.ldsPerCU = 65536;         // 64 KB
+    hw.l2SizeBytes = 8 << 20;    // 8 MB total, monolithic die
     hw.mallSizeBytes = 0;
+    hw.numXCDs = 1;
     hw.clockMHz = 1500.0;
-    // Peak BW: ~1.2 TB/s  →  1.2e12 / (1.5e9) ≈ 800 bytes/cycle
     hw.peakMemBwBytesPerCycle = 800.0;
+    hw.peakL2BwBytesPerCycle = 6000.0;  // ~9 TB/s L2 / 1.5 GHz
     break;
 
   // ── CDNA2  gfx90a  MI200 (MI210 / MI250) ────────────────────────────────
@@ -122,43 +123,51 @@ HardwareInfo HardwareInfo::get(Arch arch) {
     hw.vgprPerSimd = 256;
     hw.vgprAllocGranule = 4;
     hw.maxWavesPerSimd = 10;
-    hw.ldsPerCU = 65536;        // 64 KB
-    hw.l2SizeBytes = 8 << 20;   // 8 MB
+    hw.ldsPerCU = 65536;         // 64 KB
+    hw.l2SizeBytes = 8 << 20;    // 8 MB per die; 2 dies in MI250X
     hw.mallSizeBytes = 0;
+    hw.numXCDs = 2;              // MI250X is 2-die; MI210 is 1-die (conservative)
     hw.clockMHz = 1700.0;
-    // Peak BW: ~1.6 TB/s  →  ≈ 941 bytes/cycle
     hw.peakMemBwBytesPerCycle = 941.0;
+    hw.peakL2BwBytesPerCycle = 8000.0;  // ~13.6 TB/s L2 / 1.7 GHz
     break;
 
   // ── CDNA3  gfx940/941/942  MI300 ────────────────────────────────────────
   case Arch::CDNA3:
-    hw.numCUs = 228;           // MI300X; MI300A has 228 CUs as well
+    hw.numCUs = 228;           // MI300X; 228 CUs across 8 XCDs
     hw.numSimdPerCU = 4;
     hw.waveSize = 64;
     hw.vgprPerSimd = 256;
     hw.vgprAllocGranule = 4;
     hw.maxWavesPerSimd = 10;
-    hw.ldsPerCU = 65536;        // 64 KB
-    hw.l2SizeBytes = 256 << 20; // 256 MB (HBM3, shared across 8 XCDs)
+    hw.ldsPerCU = 65536;         // 64 KB
+    // Origami: NUM_XCD=8, L2_capacity read from HIP at runtime.
+    // Estimate: MI300X has ~256 MB L2 across 8 XCDs → 32 MB per XCD.
+    hw.l2SizeBytes = 32 << 20;   // 32 MB per XCD
     hw.mallSizeBytes = 0;
+    hw.numXCDs = 8;
     hw.clockMHz = 2100.0;
-    // Peak BW: ~5.3 TB/s for MI300X  →  ≈ 2524 bytes/cycle
     hw.peakMemBwBytesPerCycle = 2524.0;
+    hw.peakL2BwBytesPerCycle = 20000.0; // ~42 TB/s L2 / 2.1 GHz
     break;
 
-  // ── CDNA4  gfx950  MI350 ────────────────────────────────────────────────
+  // ── CDNA4  gfx950  MI350 (MI355X) ──────────────────────────────────────
   case Arch::CDNA4:
-    hw.numCUs = 256;
+    hw.numCUs = 256;             // MI355X: 256 CUs
     hw.numSimdPerCU = 4;
     hw.waveSize = 64;
-    hw.vgprPerSimd = 512;      // Doubled VGPR file vs CDNA3
+    hw.vgprPerSimd = 512;        // Doubled VGPR file vs CDNA3
     hw.vgprAllocGranule = 4;
     hw.maxWavesPerSimd = 10;
-    hw.ldsPerCU = 163840;       // 160 KB (from TargetInfo.cpp)
-    hw.l2SizeBytes = 256 << 20;
+    hw.ldsPerCU = 163840;        // 160 KB (from TargetInfo.cpp)
+    // Origami uses NUM_XCD=8 for gfx950 (same as gfx942 MI300X).
+    // L2 capacity per XCD: device L2 / 8 XCDs.
+    hw.l2SizeBytes = 32 << 20;   // 32 MB per XCD (256 MB total / 8 XCDs)
     hw.mallSizeBytes = 0;
+    hw.numXCDs = 8;              // Origami: get_default_num_xcds(gfx950) = 8
     hw.clockMHz = 2400.0;
-    hw.peakMemBwBytesPerCycle = 3000.0;
+    hw.peakMemBwBytesPerCycle = 3000.0;  // ~7.2 TB/s / 2.4 GHz
+    hw.peakL2BwBytesPerCycle = 20000.0;  // ~48 TB/s L2 / 2.4 GHz (estimated)
     break;
 
   // ── RDNA3  gfx1100/1101/1102 ────────────────────────────────────────────
@@ -574,7 +583,173 @@ int estimateLdsBytes(const GemmProblem &prob, const TritonGemmConfig &cfg,
 }
 
 //===----------------------------------------------------------------------===//
-// 4. Full performance estimate
+// 4. Origami-derived cache reuse and WGM (GROUP_SIZE_M) models
+//===----------------------------------------------------------------------===//
+//
+// These functions port Origami's predict_workgroup_mapping, compute_mall_tiles,
+// compute_l2_tiles, and estimate_l2_hit directly to Triton's tile vocabulary.
+// See origami/src/origami/gemm.cpp for the reference implementation.
+
+// Origami: compute_mall_tiles
+// Returns (mall_m, mall_n): number of unique M/N tiles visible to all active
+// CUs sharing the MALL (or the per-XCD L2 when called with cuPerXcd).
+static std::pair<int64_t, int64_t>
+computeMallTiles(int64_t gridM, int64_t gridN, int64_t activeCUs, int64_t wgm) {
+  if (gridM == 0 || gridN == 0 || activeCUs == 0)
+    return {1, 1};
+  const int64_t W         = std::max(wgm, int64_t(1));
+  const int64_t slabTiles = gridM * std::min(W, gridN);
+  const int64_t fullSlabs = std::min(activeCUs / std::max(slabTiles, int64_t(1)),
+                                     gridN / std::min(W, gridN));
+  const int64_t mallN =
+      std::min(std::max((fullSlabs + 1) * std::min(W, gridN), int64_t(1)), gridN);
+  const int64_t denom = std::max(mallN / std::min(W, gridN), int64_t(1)) * std::min(W, gridN);
+  const int64_t mallM = std::min((activeCUs + denom - 1) / denom, gridM);
+  return {std::max(mallM, int64_t(1)), std::max(mallN, int64_t(1))};
+}
+
+// Origami: compute_l2_tiles
+// Returns (l2_m, l2_n): unique tiles visible within one XCD's L2, after
+// capacity-shrinking to fit l2SizeBytes.
+static std::pair<int64_t, int64_t>
+computeL2Tiles(int64_t gridM, int64_t gridN, int64_t activeCUs,
+               int64_t wgm, int64_t numXCDs, int64_t l2SizeBytes,
+               int64_t blockM, int64_t blockK, int aBytes,
+               int64_t blockN, int bBytes) {
+  if (gridM == 0 || gridN == 0 || activeCUs == 0)
+    return {1, 1};
+  const int64_t cuPerXcd = std::max(activeCUs / std::max(numXCDs, int64_t(1)), int64_t(1));
+  const int64_t mnPerXcd = (gridM * gridN + numXCDs - 1) / numXCDs;
+  const int64_t effPerXcd = std::min(cuPerXcd, mnPerXcd);
+  auto [mallM, mallN] = computeMallTiles(gridM, gridN, effPerXcd, wgm);
+
+  // Capacity shrink: A tile = blockM × blockK bytes, B tile = blockN × blockK bytes
+  const double aBytesPerTile = static_cast<double>(blockM) * blockK * aBytes;
+  const double bBytesPerTile = static_cast<double>(blockN) * blockK * bBytes;
+  const double l2Cap = static_cast<double>(l2SizeBytes);
+
+  int64_t l2M = mallM, l2N = mallN;
+  while (l2M * aBytesPerTile + l2N * bBytesPerTile > l2Cap && (l2M > 1 || l2N > 1)) {
+    if (l2M * aBytesPerTile > l2N * bBytesPerTile && l2M > 1)
+      --l2M;
+    else if (l2N > 1)
+      --l2N;
+    else
+      --l2M;
+  }
+  return {std::max(l2M, int64_t(1)), std::max(l2N, int64_t(1))};
+}
+
+// Origami: estimate_l2_hit
+// L2 hit rate = (total_elements - unique_elements) / total_elements
+// where total = uA*l2_n + uB*l2_m, unique = uA + uB,
+//       uA = l2_m * blockM * blockK,  uB = l2_n * blockN * blockK.
+static double estimateL2HitRate(int64_t l2M, int64_t l2N,
+                                 int64_t blockM, int64_t blockK,
+                                 int64_t blockN) {
+  const int64_t uA    = l2M * blockM * blockK;
+  const int64_t uB    = l2N * blockN * blockK;
+  const int64_t total = std::max(uA * l2N + uB * l2M, int64_t(1));
+  const int64_t cached = total - (uA + uB);
+  return std::max(0.0, std::min(static_cast<double>(cached) / total, 1.0));
+}
+
+// Origami: predict_workgroup_mapping (fast path)
+// Selects the GROUP_SIZE_M (WGM slab width) that minimises the L2 working-set
+// cost for the last XCD in the first scheduling timestep.
+int selectGroupSizeM(const GemmProblem &prob, const TritonGemmConfig &cfg,
+                     const HardwareInfo &hw) {
+  const int64_t gridM  = (prob.M + cfg.blockM - 1) / cfg.blockM;
+  const int64_t gridN  = (prob.N + cfg.blockN - 1) / cfg.blockN;
+  const int64_t numMTs = gridM * gridN;
+  const int64_t N_CU   = hw.numCUs;
+  const int64_t numXCD = std::max(hw.numXCDs, 1);
+  const int64_t cuPerXcd = N_CU / numXCD;
+
+  // Trivial cases
+  if (gridM <= 1 || gridN <= 1 || numMTs <= numXCD)
+    return 1;
+
+  // Large grids: solution is insensitive → use sqrt(N_CU/numXCD)
+  const int64_t gridThreshold = static_cast<int64_t>(std::sqrt(static_cast<double>(N_CU)));
+  if (gridM > gridThreshold && gridN > gridThreshold)
+    return static_cast<int>(std::ceil(std::sqrt(static_cast<double>(N_CU / numXCD))));
+
+  const int64_t wgsPerXcd = std::min((numMTs + numXCD - 1) / numXCD, cuPerXcd);
+
+  // Enough work + small N → use grid_n directly
+  if (wgsPerXcd >= cuPerXcd / 2 && gridN <= 8)
+    return static_cast<int>(gridN);
+
+  // Build candidate set: {1, 4, 6} ∪ divisors(wgm_cap)
+  const int64_t wgmCap = std::min(gridN, wgsPerXcd / 2);
+  if (wgmCap <= 0)
+    return 1;
+
+  // Use bitmask for candidates (Origami approach; capped at 64)
+  uint64_t cmask = 0;
+  for (int64_t v : {int64_t(1), int64_t(4), int64_t(6)})
+    if (v <= wgmCap && v < 64)
+      cmask |= (1ULL << v);
+  for (int64_t i = 1; i * i <= wgmCap && i < 64; ++i) {
+    if (wgmCap % i == 0) {
+      cmask |= (1ULL << i);
+      if (wgmCap / i < 64)
+        cmask |= (1ULL << (wgmCap / i));
+    }
+  }
+
+  // Evaluate L2 working-set cost for last XCD in first timestep
+  const int64_t total        = numMTs;
+  const int64_t lastXcd      = numXCD - 2; // Origami uses NUM_XCD-2
+  const int64_t groupSize    = total >= numXCD ? total / numXCD : total;
+  const int64_t tileThisXcd  = std::min(cuPerXcd, groupSize);
+  const int64_t start        = lastXcd * groupSize;
+  const int64_t count        = (start < total)
+                                   ? std::min(tileThisXcd, total - start)
+                                   : int64_t(0);
+
+  const double aCost = static_cast<double>(cfg.blockM) * ((prob.aBits + 7) / 8);
+  const double bCost = static_cast<double>(cfg.blockN) * ((prob.bBits + 7) / 8);
+
+  int   bestWgm  = 1;
+  double bestCost = std::numeric_limits<double>::max();
+
+  for (uint64_t m = cmask; m; m &= m - 1) {
+    const int64_t wgm       = static_cast<int64_t>(__builtin_ctzll(m));
+    const int64_t slabTiles = gridM * wgm;
+    const int64_t firstSlab = start / slabTiles;
+    const int64_t lastSlab  = count > 0 ? (start + count - 1) / slabTiles : firstSlab;
+    const int64_t firstRow  = (start % slabTiles) / wgm;
+    const int64_t lastRow   = count > 0
+                                  ? ((start + count - 1) % slabTiles) / wgm
+                                  : firstRow;
+
+    int64_t uniqueRows, uniqueCols;
+    if (firstSlab == lastSlab) {
+      uniqueRows = lastRow - firstRow + 1;
+      uniqueCols = (uniqueRows > 1) ? wgm
+                                    : std::min(count, wgm);
+    } else {
+      uniqueRows = (lastSlab - firstSlab > 1)
+                       ? gridM
+                       : std::min(gridM, (gridM - firstRow) + (lastRow + 1));
+      uniqueCols = std::min((lastSlab - firstSlab + 1) * wgm, gridN);
+    }
+    uniqueRows = std::min(uniqueRows, gridM);
+    uniqueCols = std::min(uniqueCols, gridN);
+
+    const double cost = uniqueRows * aCost + uniqueCols * bCost;
+    if (cost < bestCost) {
+      bestCost = cost;
+      bestWgm  = static_cast<int>(wgm);
+    }
+  }
+  return bestWgm;
+}
+
+//===----------------------------------------------------------------------===//
+// 5. Full performance estimate
 //===----------------------------------------------------------------------===//
 
 PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
@@ -695,9 +870,31 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   double tileBytesC  = static_cast<double>(cfg.blockM * cfg.blockN * cBytes);
   double tileBytesTotal = tileBytesAB + tileBytesC;
 
-  // Each CU gets an equal share of peak memory bandwidth.
-  double bwPerCU = hw.peakMemBwBytesPerCycle / hw.numCUs;
-  est.memoryCycles = (bwPerCU > 0.0) ? (tileBytesAB / bwPerCU) : 0.0;
+  // Memory cycles: model cache hierarchy using Origami's L2 hit-rate formula.
+  // L2 hit rate reduces effective DRAM traffic; hits are served at L2 bandwidth.
+  const int64_t gridM = ceildiv(prob.M, cfg.blockM);
+  const int64_t gridN = ceildiv(prob.N, cfg.blockN);
+  const int wgm = (cfg.groupSizeM > 0) ? cfg.groupSizeM
+                                        : selectGroupSizeM(prob, cfg, hw);
+
+  double l2HitRate = 0.0;
+  if (hw.l2SizeBytes > 0 && hw.numCUs > 0 && gridM > 0 && gridN > 0) {
+    auto [l2M, l2N] = computeL2Tiles(
+        gridM, gridN, hw.numCUs, wgm, hw.numXCDs, hw.l2SizeBytes,
+        cfg.blockM, cfg.blockK, aBytes, cfg.blockN, bBytes);
+    l2HitRate = estimateL2HitRate(l2M, l2N, cfg.blockM, cfg.blockK, cfg.blockN);
+  }
+
+  // Effective bandwidth: DRAM for misses, L2 for hits.
+  // bwPerCU is the per-CU share; L2 bandwidth >> DRAM bandwidth.
+  const double dramBwPerCU = hw.peakMemBwBytesPerCycle / std::max(hw.numCUs, 1);
+  const double l2BwPerCU   = hw.peakL2BwBytesPerCycle  / std::max(hw.numCUs, 1);
+  const double dramTraffic = tileBytesAB * (1.0 - l2HitRate);
+  const double l2Traffic   = tileBytesAB * l2HitRate;
+  const double memCycles =
+      (dramBwPerCU > 0.0 ? dramTraffic / dramBwPerCU : 0.0) +
+      (l2BwPerCU   > 0.0 ? l2Traffic   / l2BwPerCU   : 0.0);
+  est.memoryCycles = memCycles;
 
   // ── Step 4: Software-pipeline overlap ─────────────────────────────────────
   //
@@ -979,6 +1176,7 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
           cfg.useAsyncCopy = true;
           cfg.kPack       = 1;
           cfg.wavesPerEu  = 0;
+          cfg.groupSizeM  = selectGroupSizeM(prob, cfg, hw);
 
           if (isValidConfig(prob, cfg, hw))
             candidates.push_back(cfg);

@@ -149,12 +149,15 @@ def config_to_kernel_kwargs(cfg) -> dict:
 
     Returns a flat dict suitable for unpacking directly into the kernel call:
       matmul_kernel[grid](..., **config_to_kernel_kwargs(cfg))
+
+    group_size_m is set by selectGroupSizeM() using Origami's WGM prediction.
     """
     return {
         "BLOCK_SIZE_M":         cfg.block_m,
         "BLOCK_SIZE_N":         cfg.block_n,
         "BLOCK_SIZE_K":         cfg.block_k,
         "matrix_instr_nonkdim": cfg.mfma_non_k_dim,
+        "GROUP_SIZE_M":         cfg.group_size_m,
         "num_warps":            cfg.num_warps,
         "num_stages":           cfg.num_stages,
     }
