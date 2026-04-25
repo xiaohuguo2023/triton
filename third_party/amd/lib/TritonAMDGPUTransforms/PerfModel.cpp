@@ -741,9 +741,9 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // occupancy does not limit throughput — the MFMA units are saturated
   // regardless of how many other waves are resident.
   //
-  // For memory-bound kernels we apply a moderate occupancy penalty capped at
-  // 2× (i.e., minimum effective occupancy = 0.5) to avoid over-penalising
-  // configs with slightly low occupancy.
+  // Occupancy penalty: for compute-bound kernels, no penalty (MFMA saturated).
+  // For memory-bound kernels, low occupancy limits latency hiding.
+  // Cap at 2× (min effective occupancy = 0.5) to avoid over-penalising.
   double occupancyPenalty = est.isComputeBound
                                 ? 1.0
                                 : (1.0 / std::max(est.occupancy, 0.5));
