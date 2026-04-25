@@ -305,12 +305,14 @@ static constexpr ThroughputEntry kMfmaThroughputTable[] = {
   {Arch::CDNA3, 16, 16, 16, 32, ElemKind::I8,    ElemKind::I8},
 
   // ── CDNA4  (gfx950) ───────────────────────────────────────────────────────
-  // Same instruction latencies as CDNA3, but 512 VGPRs per SIMD allows higher
-  // occupancy.  Scaled MFMA (F8F6F4) adds new instruction shapes.
-  {Arch::CDNA4, 32, 32,  8, 64, ElemKind::FP16,  ElemKind::FP32},
-  {Arch::CDNA4, 16, 16, 16, 32, ElemKind::FP16,  ElemKind::FP32},
-  {Arch::CDNA4, 32, 32,  4, 64, ElemKind::BF16,  ElemKind::FP32},
-  {Arch::CDNA4, 16, 16,  8, 32, ElemKind::BF16,  ElemKind::FP32},
+  // gfx950 introduces wider MFMA variants (mfma_f32_32x32x16_f16,
+  // mfma_f32_16x16x32_f16) with double the kDim vs CDNA3. Same latency in
+  // cycles but processes 2× more K elements per instruction, halving the
+  // number of MFMA ops per tile. Source: MfmaGroup.cpp TRITON_MFMA_v4_2case.
+  {Arch::CDNA4, 32, 32, 16, 64, ElemKind::FP16,  ElemKind::FP32},
+  {Arch::CDNA4, 16, 16, 32, 32, ElemKind::FP16,  ElemKind::FP32},
+  {Arch::CDNA4, 32, 32, 16, 64, ElemKind::BF16,  ElemKind::FP32},
+  {Arch::CDNA4, 16, 16, 32, 32, ElemKind::BF16,  ElemKind::FP32},
   {Arch::CDNA4, 32, 32, 16, 64, ElemKind::FP8,   ElemKind::FP32},
   {Arch::CDNA4, 16, 16, 32, 32, ElemKind::FP8,   ElemKind::FP32},
   {Arch::CDNA4, 32, 32, 32, 64, ElemKind::FP6,   ElemKind::FP32},
@@ -458,9 +460,14 @@ static int deriveKWidth(const GemmProblem &prob, const TritonGemmConfig &cfg,
     return 8; // safe fallback for unknown intrinsics
 
   // kBase: elements per thread per MFMA issue.
-  // The ratio kDim / mDim encodes the relationship documented in
-  // AccelerateAMDMatmul.cpp: larger mDim → fewer k-elements per thread.
-  const int kBase = std::max(1, infoOpt->kDim / mDim);
+  // From AccelerateAMDMatmul.cpp (MfmaGroup::kBase field):
+  //   mfma_32x32: kBase = kDim / 2
+  //   mfma_16x16: kBase = kDim / 4
+  //   mfma_4x4:   kBase = kDim / 16
+  // This matches the TRITON_MFMA_v4_2case entries in MfmaGroup.cpp where
+  // kBase is explicitly listed (e.g. 32x32x16 has kBase=8 = 16/2).
+  const int divisor = (mDim >= 32) ? 2 : (mDim >= 16) ? 4 : 16;
+  const int kBase = std::max(1, infoOpt->kDim / divisor);
   return kBase * std::max(1, cfg.kPack);
 }
 
@@ -471,11 +478,14 @@ int estimateVgpr(const GemmProblem &prob, const TritonGemmConfig &cfg,
   const int ws = hw.waveSize;
 
   // Accumulator tile: BLOCK_M × BLOCK_N elements of the C type, distributed
-  // across all lanes in the wavefront.
+  // across all lanes across all warps in the CTA.
+  // Each warp covers (BLOCK_M × BLOCK_N / numWarps) output elements,
+  // distributed across waveSize lanes: vgprAccum per warp = that / waveSize.
   const int cBytes = (prob.cBits + 7) / 8;
+  const int numWarps = std::max(1, cfg.numWarps);
   const int vgprAccum =
-      (cfg.blockM * cfg.blockN * cBytes + ws * bytesPerVgpr - 1) /
-      (ws * bytesPerVgpr);
+      (cfg.blockM * cfg.blockN * cBytes + numWarps * ws * bytesPerVgpr - 1) /
+      (numWarps * ws * bytesPerVgpr);
 
   // A and B register fragments: kWidth elements per lane, each of width aBits.
   // kWidth is derived from the MFMA intrinsic table when not explicitly set,
@@ -501,6 +511,27 @@ int estimateVgpr(const GemmProblem &prob, const TritonGemmConfig &cfg,
          hw.vgprAllocGranule;
 }
 
+// Padding helpers matching TensorAtlas's hardware.py formulas, which in turn
+// mirror Triton's PaddedSharedEncodingAttr::getPaddedSize().
+
+// [[32, 4]] padding pattern: 4 padding elements per 32-element block.
+static int64_t ldspadded32x4(int64_t n) {
+  int64_t p = (n >> 5) << 2;
+  if ((n & 31) == 0 && p >= 4)
+    p -= 4;
+  return n + p;
+}
+
+// [[interval, 8]] padding pattern: 8 padding elements per interval-element
+// block.  interval must be a power of 2.
+static int64_t ldspaddedDim8(int64_t n, int interval) {
+  int log2Interval = __builtin_ctz(static_cast<unsigned>(interval));
+  int64_t p = (n >> log2Interval) << 3; // * 8
+  if (n % interval == 0 && p >= 8)
+    p -= 8;
+  return n + p;
+}
+
 int estimateLdsBytes(const GemmProblem &prob, const TritonGemmConfig &cfg,
                      const HardwareInfo &hw) {
   if (cfg.bypassLds)
@@ -510,16 +541,35 @@ int estimateLdsBytes(const GemmProblem &prob, const TritonGemmConfig &cfg,
   const int aBytes = (prob.aBits + 7) / 8;
   const int bBytes = (prob.bBits + 7) / 8;
 
-  // 8-element padding per row avoids the most common LDS bank-conflict pattern
-  // without requiring architecture-specific alignment analysis.
-  // (AccelerateAMDMatmul.cpp::composePaddedLayout handles the exact version.)
-  constexpr int paddingElems = 8;
+  if (cfg.useAsyncCopy) {
+    // Async-copy path uses PaddedSharedEncoding — apply TensorAtlas's formula:
+    //   padded = max(_padded32x4(elem), _paddedDim8(elem, dim))
+    // matching Triton's composePaddedLayoutForAsyncCopyCDNA4 intent.
+    int64_t elemA = (int64_t)cfg.blockM * cfg.blockK;
+    int64_t elemB = (int64_t)cfg.blockN * cfg.blockK;
 
-  const int ldsA =
-      numBuf * cfg.blockM * (cfg.blockK + paddingElems) * aBytes;
-  const int ldsB =
-      numBuf * cfg.blockN * (cfg.blockK + paddingElems) * bBytes;
+    int64_t paddedA = ldspadded32x4(elemA);
+    int64_t paddedB = ldspadded32x4(elemB);
 
+    // blockK power-of-2: also check [[blockK, 8]] for A.
+    if (cfg.blockK > 0 && (cfg.blockK & (cfg.blockK - 1)) == 0) {
+      int64_t pa = ldspaddedDim8(elemA, cfg.blockK);
+      if (pa > paddedA)
+        paddedA = pa;
+    }
+    // blockN power-of-2: also check [[blockN, 8]] for B.
+    if (cfg.blockN > 0 && (cfg.blockN & (cfg.blockN - 1)) == 0) {
+      int64_t pb = ldspaddedDim8(elemB, cfg.blockN);
+      if (pb > paddedB)
+        paddedB = pb;
+    }
+
+    return static_cast<int>(numBuf * (paddedA * aBytes + paddedB * bBytes));
+  }
+
+  // Synchronous copy: conservative 8-element row padding.
+  const int ldsA = numBuf * cfg.blockM * (cfg.blockK + 8) * aBytes;
+  const int ldsB = numBuf * cfg.blockN * (cfg.blockK + 8) * bBytes;
   return ldsA + ldsB;
 }
 
@@ -549,9 +599,11 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   est.wavesPerSimd = std::min(hw.maxWavesPerSimd,
                               hw.vgprPerSimd / std::max(1, est.vgprCount));
   // Heuristic spill threshold: if < 1 wave fits, we hard-spill.
-  // If waves_per_simd is 1 and vgprCount > 192, light spilling is likely.
+  // Light spill threshold scales with the VGPR file size: 75% of vgprPerSimd.
+  // On CDNA3 (256 VGPRs) this is ~192; on CDNA4 (512 VGPRs) this is ~384.
+  const int spillThreshold = (hw.vgprPerSimd * 3) / 4;
   est.likelySpills = (est.vgprCount > hw.vgprPerSimd) ||
-                     (est.wavesPerSimd == 1 && est.vgprCount > 192);
+                     (est.wavesPerSimd == 1 && est.vgprCount > spillThreshold);
 
   // CTA-limited occupancy from LDS.
   int ctasFromLds = (est.ldsBytes > 0)
@@ -587,58 +639,61 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
           : (static_cast<double>(est.totalOutputTiles) /
              (static_cast<double>(est.numWaves) * hw.numCUs));
 
-  // ── Step 3: Roofline per tile ─────────────────────────────────────────────
+  // ── Step 3: Roofline across the full K reduction ──────────────────────────
+  //
+  // A critical fix vs a naive per-tile roofline: each output tile requires
+  // ceil(K / BLOCK_K) K-loop iterations.  A small BLOCK_K processes fewer
+  // elements per iteration but runs many more iterations, making it slower
+  // than a large BLOCK_K despite lower per-iteration cost.  This matches
+  // Origami's num_iter term in compute_total_latency().
+  //
+  //   numKIter          = ceil(K / BLOCK_K)
+  //   numMfmaPerKBlock  = (BLOCK_M/mDim) * (BLOCK_N/nDim) * (BLOCK_K/kDim)
+  //   computeCycles     = numMfmaPerKBlock * numKIter * throughputCycles
+  //                       / numSimdPerCU
 
-  // Compute cycles: how many MFMA cycles does one output tile require on a
-  // single CU?
-  //
-  //   numMfma = (BLOCK_M/mDim) * (BLOCK_N/nDim) * (BLOCK_K/kDim)
-  //   computeCycles = numMfma * throughputCycles / numSimdPerCU
-  //
-  // We resolve the chosen mDim/nDim from cfg or fall back to the model's
-  // selection.  If no matching intrinsic exists, use a synthetic estimate.
   int mDim = cfg.mfmaNonKDim > 0
                  ? cfg.mfmaNonKDim
                  : selectMfmaNonKDim(prob, cfg, hw);
 
+  const int64_t numKIter =
+      (cfg.blockK > 0) ? ceildiv(prob.K, cfg.blockK) : 1;
+
   auto infoOpt = getMfmaInstrInfo(hw.arch, mDim, mDim, prob.aKind, prob.cKind);
   if (!infoOpt) {
-    // Fall back to 16x16 FP16→FP32 as a representative entry.
     infoOpt = getMfmaInstrInfo(hw.arch, 16, 16, ElemKind::FP16, ElemKind::FP32);
   }
 
   if (infoOpt) {
     const MfmaInstrInfo &info = *infoOpt;
-    // Number of MFMA instructions to cover one output tile.
-    int64_t numMfma = static_cast<int64_t>(ceildiv(cfg.blockM, info.mDim)) *
-                      ceildiv(cfg.blockN, info.nDim) *
-                      ceildiv(cfg.blockK, info.kDim);
-    // All SIMDs in the CU work in parallel (one wave per SIMD for the warp
-    // group), so divide by numSimdPerCU.
+    int64_t numMfmaPerKBlock =
+        static_cast<int64_t>(ceildiv(cfg.blockM, info.mDim)) *
+        ceildiv(cfg.blockN, info.nDim) *
+        ceildiv(cfg.blockK, info.kDim);
     est.computeCycles =
-        static_cast<double>(numMfma * info.throughputCycles) / hw.numSimdPerCU;
+        static_cast<double>(numMfmaPerKBlock * numKIter * info.throughputCycles)
+        / hw.numSimdPerCU;
   } else {
-    // Synthetic fallback: derive from peak FLOP rate.
-    double tileFlops =
-        2.0 * cfg.blockM * cfg.blockN * cfg.blockK;
-    est.computeCycles = tileFlops / hw.peakMfmaFlopsPerCycleCU();
+    // Fallback: full GEMM FLOPs for this output tile.
+    est.computeCycles =
+        (2.0 * cfg.blockM * cfg.blockN * prob.K) / hw.peakMfmaFlopsPerCycleCU();
   }
 
-  // Memory cycles: time to stream A and B tiles from global memory.
-  // We attribute all A/B reads to global memory (worst case; L2/MALL hits
-  // improve this in practice but require knowledge of the access pattern).
+  // Memory cycles: total A/B traffic across all K iterations.
   const int aBytes = (prob.aBits + 7) / 8;
   const int bBytes = (prob.bBits + 7) / 8;
   const int cBytes = (prob.cBits + 7) / 8;
 
-  double tileBytesAB =
+  // Per K-block fetch (one stage worth of A+B).
+  double tileBytesABperK =
       static_cast<double>(cfg.blockM * cfg.blockK * aBytes +
                           cfg.blockN * cfg.blockK * bBytes);
-  double tileBytesC =
-      static_cast<double>(cfg.blockM * cfg.blockN * cBytes);
+  // Total A/B traffic: numKIter fetches of the K-block.
+  double tileBytesAB = tileBytesABperK * numKIter;
+  double tileBytesC  = static_cast<double>(cfg.blockM * cfg.blockN * cBytes);
   double tileBytesTotal = tileBytesAB + tileBytesC;
 
-  // Each CU receives an equal share of total memory bandwidth.
+  // Each CU gets an equal share of peak memory bandwidth.
   double bwPerCU = hw.peakMemBwBytesPerCycle / hw.numCUs;
   est.memoryCycles = (bwPerCU > 0.0) ? (tileBytesAB / bwPerCU) : 0.0;
 
