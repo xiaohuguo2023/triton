@@ -1155,17 +1155,34 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
                                    prob.aKind, prob.cKind))
     mfmaKDim = info->kDim;
 
-  // blockK candidates: 1×, 2×, 4× the MFMA kDim.
-  // Cap at 4×kDim: from empirical calibration (testtmp/calibrate_l2_bw.py),
-  // BK=8×kDim (=256 for gfx950) is fastest for M≤1024 (fits in L2) but
-  // drops for M≥2048 when the working set exceeds L2 per XCD. Since we
-  // don't yet model this M-dependent L2 capacity constraint, conservatively
-  // cap at 4×kDim (=128 for gfx950) which performs well across all M.
-  const int blockKCandidates[] = {
-      mfmaKDim,
-      mfmaKDim * 2,
-      mfmaKDim * 4,
-  };
+  // blockK candidates depend on the problem's utilization regime.
+  //
+  // Small-M regime (M ≤ 4×mfmaDim OR approxOutputTiles < numCUs/2):
+  //   Use up to 16×kDim (BK=512 for gfx950 FP16).
+  //   Validated by AITER experiment (testtmp/test_aiter_tiles.py):
+  //   BK=512 is 18-29% faster than BK=128 for M≤32 with large N (N≥5120)
+  //   because fewer K-iterations reduces loop overhead, and the smaller
+  //   output tile count means L2 capacity is not the bottleneck.
+  //
+  // Normal regime (large M):
+  //   Cap at 4×kDim (=128 for gfx950) — calibration shows BK=256/512
+  //   hurt for M≥2048 when the L2 working set per XCD is exceeded.
+  //
+  // approxOutputTiles uses the minimum tile size (2×mfmaDim) as a proxy
+  // for the actual tile count before the tile list is generated.
+  const int64_t approxOutputTiles =
+      ((prob.M + 2 * mfmaDim - 1) / (2 * mfmaDim)) *
+      ((prob.N + 2 * mfmaDim - 1) / (2 * mfmaDim));
+  const bool smallMRegime =
+      (prob.M <= 4 * mfmaDim) ||
+      (hw.numCUs > 0 && approxOutputTiles < hw.numCUs / 2);
+
+  // Build blockK candidates as a vector since size depends on regime.
+  std::vector<int> blockKVec = {mfmaKDim, mfmaKDim * 2, mfmaKDim * 4};
+  if (smallMRegime) {
+    blockKVec.push_back(mfmaKDim * 8);  // BK=256 for gfx950
+    blockKVec.push_back(mfmaKDim * 16); // BK=512 for gfx950
+  }
 
   // Step 3: generate (blockM, blockN) pairs using Origami's wave-based formula:
   //   blockM = mfmaDim × waveTileM × waveCountM
@@ -1215,11 +1232,11 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
   // Step 5: enumerate all combinations and keep feasible ones.
   // Reserve the theoretical upper bound to avoid reallocation.
   std::vector<TritonGemmConfig> candidates;
-  candidates.reserve(mnPairs.size() * std::size(blockKCandidates) *
+  candidates.reserve(mnPairs.size() * blockKVec.size() *
                      std::size(numWarpsCandidates) *
                      std::size(numStagesCandidates));
   for (auto [bM, bN] : mnPairs) {
-    for (int bK : blockKCandidates) {
+    for (int bK : blockKVec) {
       if (bK > 256)
         continue;
       for (int nW : numWarpsCandidates) {
