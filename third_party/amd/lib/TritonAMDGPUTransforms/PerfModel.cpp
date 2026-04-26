@@ -1173,9 +1173,13 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
   const int64_t approxOutputTiles =
       ((prob.M + 2 * mfmaDim - 1) / (2 * mfmaDim)) *
       ((prob.N + 2 * mfmaDim - 1) / (2 * mfmaDim));
+  // Small-M regime: allow larger BK candidates (BK=256/512) when output tiles
+  // are few enough that K-loop overhead dominates over LDS pressure.
+  // Threshold: approxOutputTiles < numCUs * 4 covers M≤1024 on gfx950 (256 CUs),
+  // validated by calibrate_l2_bw.py (BK=128 > BK=64 for M≤1024 64×64 tile).
   const bool smallMRegime =
       (prob.M <= 4 * mfmaDim) ||
-      (hw.numCUs > 0 && approxOutputTiles < hw.numCUs / 2);
+      (hw.numCUs > 0 && approxOutputTiles < hw.numCUs * 4);
 
   // Build blockK candidates as a vector since size depends on regime.
   std::vector<int> blockKVec = {mfmaKDim, mfmaKDim * 2, mfmaKDim * 4};
