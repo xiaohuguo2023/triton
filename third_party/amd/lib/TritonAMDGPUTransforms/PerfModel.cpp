@@ -1237,8 +1237,6 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
                      std::size(numStagesCandidates));
   for (auto [bM, bN] : mnPairs) {
     for (int bK : blockKVec) {
-      if (bK > 256)
-        continue;
       for (int nW : numWarpsCandidates) {
         if (cdna4Only && nW != 8) // gfx950 requires nW=8 for pingpong
           continue;
