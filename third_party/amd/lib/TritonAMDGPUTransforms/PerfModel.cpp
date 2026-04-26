@@ -167,11 +167,17 @@ HardwareInfo HardwareInfo::get(Arch arch) {
     hw.numXCDs = 8;              // Origami: get_default_num_xcds(gfx950) = 8
     hw.clockMHz = 2400.0;
     hw.peakMemBwBytesPerCycle = 3000.0;  // ~7.2 TB/s / 2.4 GHz
-    // Calibrated value from testtmp/calibrate_l2_bw.py: ~17900 bytes/cycle
-    // (peak effective BW ~43 TB/s observed at M=2048 BK=128 on MI355X).
-    // Set to 0 until BK candidate capping is implemented to prevent the L2
-    // model from over-preferring large BK at problem sizes where it hurts.
-    hw.peakL2BwBytesPerCycle = 0.0;  // re-enable after BK cap fix
+    // Calibrated from testtmp/calibrate_l2_bw.py on MI355X:
+    // Peak effective BW ~43 TB/s observed at M=2048 BK=128 (64×64 tile).
+    // 43e12 / 2.4e9 ≈ 17900 bytes/cycle device-wide.
+    //
+    // IMPORTANT: L2 hit rate formula is BK-independent (BK cancels in uA/uB),
+    // so this does NOT fix BK selection. Enabling it causes regressions because
+    // the L2 boost makes memory-bound small tiles look better than they are for
+    // large-M shapes with many output tiles. The L2 model needs per-shape
+    // calibration of l2_m, l2_n before it can be safely enabled.
+    // See docs/perf-model-skill.md Gap 4 for details.
+    hw.peakL2BwBytesPerCycle = 0.0;  // TODO: enable after per-shape calibration
     break;
 
   // ── RDNA3  gfx1100/1101/1102 ────────────────────────────────────────────
@@ -926,26 +932,63 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   }
   est.memoryCycles = memCycles;
 
-  // ── Step 4: Software-pipeline overlap ─────────────────────────────────────
+  // ── Step 4: TCP-capped pipeline overlap (gluon memory_bandwidth_model.md) ───
   //
-  // With numStages software pipeline stages the compiler issues global-memory
-  // reads numStages−1 iterations ahead of the compute that consumes them.
-  // When there are enough waves (occupancy) to fill the pipeline depth the
-  // memory latency becomes fully hidden.
+  // Effective pipeline depth from gluon's E2E model:
   //
-  // Simple model:
-  //   overlap = min(1, (numStages - 1) / pipelineDepthNeeded)
-  // where pipelineDepthNeeded ≈ memoryCycles / computeCycles.
+  //   data_per_request_per_wave = (A_tile + B_tile) / numWarps   [bytes per wave per K-block]
+  //   effective_pipeline_depth  = min(numStages - 1,
+  //                                   TCPsizeBytes / (numActiveWaves × dataPerWave))
+  //   iter_latency = max(hbm_latency / effective_pipeline_depth, compute_latency)
+  //   overlap      = 1 - compute_latency / iter_latency
   //
-  // If compute already dominates (memoryCycles < computeCycles) there is
-  // nothing to hide and overlap is irrelevant.
-  double depthNeeded = (est.computeCycles > 0.0)
-                           ? est.memoryCycles / est.computeCycles
-                           : 1.0;
-  double stageFactor = (depthNeeded > 0.0)
-                           ? static_cast<double>(cfg.numStages - 1) / depthNeeded
-                           : 1.0;
-  est.pipelineOverlap = std::min(1.0, std::max(0.0, stageFactor));
+  // The TCP (L1 cache, 32 KB per CU on GFX9/GFX950) caps how many in-flight
+  // bytes each CU can sustain. Larger data_per_wave (from larger BK) means fewer
+  // in-flight slots → lower effective pipeline depth → less memory latency hiding.
+  // This is why BK=64 outperforms BK=128 at M=1536 despite identical TFLOPS in the
+  // naive roofline: the TCP cap limits BK=128's pipeline depth more severely.
+  //
+  // Constants (GFX950 / CDNA4):
+  constexpr double tcpSizeBytes = 32768.0; // TCP = 32 KB per CU (GFX9/GFX950)
+  // HBM round-trip latency in cycles (≈1000 cycles for CDNA/gfx950).
+  // This is the key hardware constant that determines how many pipeline stages
+  // are needed to hide memory latency — calibrated from gluon tutorial analysis.
+  constexpr double hbmLatencyCycles = 1000.0;
+
+  // Bytes loaded per K-block iteration, split across numWarps waves in the CTA.
+  const double blockSizeBytes = tileBytesABperK; // A+B tile per K-block (before numKIter)
+  const double dataPerWave =
+      (cfg.numWarps > 0) ? blockSizeBytes / cfg.numWarps : blockSizeBytes;
+
+  // Effective in-flight depth: TCP cap limits how many per-wave requests fit.
+  // numActiveWaves = est.wavesPerSimd × numSimdPerCU (VGPR-limited only).
+  const int numActiveWaves = std::max(1, static_cast<int>(vgprOccupancy * hw.numSimdPerCU * hw.maxWavesPerSimd));
+  const double tcpDepth = (dataPerWave > 0.0 && numActiveWaves > 0)
+                              ? tcpSizeBytes / (numActiveWaves * dataPerWave)
+                              : static_cast<double>(cfg.numStages - 1);
+  const double effectivePipelineDepth =
+      std::min(static_cast<double>(cfg.numStages - 1), tcpDepth);
+
+  // Iter latency from gluon E2E model:
+  //   iter_latency = max(hbm_latency / effective_depth, compute_latency_per_iter)
+  // We express compute_latency as computeCycles (already across full K-loop).
+  // Map to per-iter: compute_latency_per_iter = computeCycles / numKIter.
+  const double computePerIter = (numKIter > 0.0) ? est.computeCycles / numKIter : est.computeCycles;
+  const double memPerIter     = (numKIter > 0.0) ? est.memoryCycles / numKIter  : est.memoryCycles;
+
+  // iter_latency = max(hbm_latency/depth, compute_per_iter)
+  const double iterLatency = std::max(
+      (effectivePipelineDepth > 0.0) ? hbmLatencyCycles / effectivePipelineDepth : hbmLatencyCycles,
+      computePerIter);
+
+  // overlap = fraction of memory latency hidden by the pipeline.
+  // When iterLatency == computePerIter: all memory hidden → overlap=1.
+  // When iterLatency == hbm/depth: memory stalls, overlap < 1.
+  const double pipelineOverlapGluon =
+      (iterLatency > 0.0 && memPerIter > 0.0)
+          ? std::min(1.0, 1.0 - (iterLatency - computePerIter) / memPerIter)
+          : 1.0;
+  est.pipelineOverlap = std::max(0.0, pipelineOverlapGluon);
 
   // Effective tile cycles: compute dominates, memory visible only to the
   // extent it is not hidden by pipelining.
