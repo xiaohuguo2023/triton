@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "buffer_atomic_add", "buffer_atomic_and", "buffer_atomic_min", "buffer_atomic_max", "buffer_atomic_or",
-    "buffer_atomic_xor", "buffer_atomic_xor", "buffer_load", "buffer_store", "mfma"
+    "buffer_atomic_xor", "buffer_atomic_xor", "buffer_load", "buffer_store", "mfma", "extract_slice"
 ]
 
 _atomic_op_str_to_op = {
@@ -171,6 +171,15 @@ def mfma(a, b, acc, _semantic: GluonSemantic = None):
     handle = _semantic.dot(a, b, acc, input_precision=knobs.language.fp32_default, max_num_imprecise_acc=None,
                            out_dtype=acc.dtype).handle
     return ttgl.tensor(handle, ret_type)
+
+
+@builtin
+def extract_slice(src, shape, offsets, _semantic: GluonSemantic = None):
+    src_ty = src.type
+    builder = _semantic.builder
+    res_ty = ttgl.distributed_type(src_ty.element_ty, shape, src_ty.layout)
+    handle = builder.create_extract_slice(res_ty.to_ir(builder), src.handle, offsets)
+    return _semantic.tensor(handle, res_ty)
 
 
 """
