@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "buffer_atomic_add", "buffer_atomic_and", "buffer_atomic_min", "buffer_atomic_max", "buffer_atomic_or",
-    "buffer_atomic_xor", "buffer_atomic_xor", "buffer_load", "buffer_store", "mfma", "scaled_upcast"
+    "buffer_atomic_xor", "buffer_atomic_xor", "buffer_load", "buffer_store", "mfma", "scaled_upcast", "extract_slice"
 ]
 
 _atomic_op_str_to_op = {
@@ -207,6 +207,15 @@ def scaled_upcast(src, scale, elem_type, axis=None, _semantic=None):
         f"Expected scale to use raw E8M0 payload in int8/uint8 but got {scale.dtype}"
     scale = _convert_e8m0_scale_to_bf16(scale, _semantic)
     return _scaled_upcast(src, scale, elem_type, axis, _semantic)
+
+
+@builtin
+def extract_slice(src, shape, offsets, _semantic: GluonSemantic = None):
+    src_ty = src.type
+    builder = _semantic.builder
+    res_ty = ttgl.distributed_type(src_ty.element_ty, shape, src_ty.layout)
+    handle = builder.create_extract_slice(res_ty.to_ir(builder), src.handle, offsets)
+    return _semantic.tensor(handle, res_ty)
 
 
 """

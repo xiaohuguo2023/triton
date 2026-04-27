@@ -1106,6 +1106,11 @@ void init_gluon_ir(py::module &&m) {
            [](GluonOpBuilder &self) {
              self.create<ttag::ClusterBarrierWaitOp>();
            })
+      .def("create_extract_slice",
+           [](GluonOpBuilder &self, Type resultType, Value src,
+              std::vector<int64_t> &offsets) -> Value {
+             return self.create<ttag::ExtractSliceOp>(resultType, src, offsets);
+           })
       .def("create_warp_pipeline_border",
            [](GluonOpBuilder &self, const std::string &marker, int priority) {
              auto border = self.create<ROCDL::SchedBarrier>(0);
