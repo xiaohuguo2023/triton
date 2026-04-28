@@ -360,6 +360,12 @@ void init_triton_amd_perf_model(py::module &&m) {
       .value("Unknown", ElemKind::Unknown)
       .export_values();
 
+  // ── KernelType ─────────────────────────────────────────────────────────────
+  py::enum_<KernelType>(m, "KernelType")
+      .value("Standard", KernelType::Standard)
+      .value("Gluon",    KernelType::Gluon)
+      .export_values();
+
   // ── HardwareInfo ───────────────────────────────────────────────────────────
   // All fields are precomputed at construction — expose as read-only
   // properties to avoid copies on access.
@@ -450,13 +456,16 @@ void init_triton_amd_perf_model(py::module &&m) {
   // topK=0 means return all ranked configs (uses stable_sort).
   // topK>0 uses partial_sort — O(N log K) instead of O(N log N).
   m.def("generate_candidates",
-        [](const GemmProblem &prob, const HardwareInfo &hw) {
-          return generateCandidates(prob, hw);
+        [](const GemmProblem &prob, const HardwareInfo &hw,
+           KernelType kernelType) {
+          return generateCandidates(prob, hw, kernelType);
         },
         py::arg("prob"), py::arg("hw"),
-        "Generate all feasible TritonGemmConfig candidates for a GEMM "
-        "problem on the given hardware. All returned configs pass "
-        "isValidConfig (LDS fits, VGPR fits, kDim aligned).");
+        py::arg("kernel_type") = KernelType::Standard,
+        "Generate feasible TritonGemmConfig candidates. "
+        "kernel_type='Standard' sweeps full numWarps/numStages range; "
+        "'Gluon' constrains to numWarps=4, numStages=2, BM/BN multiples of 128, "
+        "and K%(2*BK)==0 for v9-style 4-quadrant pipelined kernels.");
 
   m.def("rank_configs",
         [](const GemmProblem &prob,

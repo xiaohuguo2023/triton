@@ -94,22 +94,23 @@ def pick_gemm_config(
     b_dtype: str = None,
     c_dtype: str = "fp32",
     top_k: int = 1,
+    kernel_type: str = "standard",
 ):
     """
     Analytically select the best GEMM config(s) for the given problem.
 
     Parameters
     ----------
-    M, N, K    : Problem dimensions.
-    a_dtype    : Input A element dtype string (e.g. "fp16", "bf16", "fp8").
-    arch       : GPU architecture string (e.g. "gfx942", "gfx90a").
-    b_dtype    : Input B element dtype. Defaults to a_dtype.
-    c_dtype    : Accumulator dtype. Defaults to "fp32".
-    top_k      : Number of configs to return, ranked best-first.
-                 Use top_k=1 (default) in production.
-                 Use top_k>1 to diagnose mispredictions:
-                   configs = pick_gemm_config(..., top_k=5)
-                   # benchmark configs[1:] vs configs[0] to detect issues
+    M, N, K     : Problem dimensions.
+    a_dtype     : Input A element dtype string (e.g. "fp16", "bf16", "fp8").
+    arch        : GPU architecture string (e.g. "gfx942", "gfx90a").
+    b_dtype     : Input B element dtype. Defaults to a_dtype.
+    c_dtype     : Accumulator dtype. Defaults to "fp32".
+    top_k       : Number of configs to return, ranked best-first.
+    kernel_type : "standard" (default) for the compiler-pipelined triton matmul;
+                  "gluon" for v9-style hand-tuned 4-quadrant kernels.
+                  Gluon constraints: numWarps=4, numStages=2,
+                  blockM/blockN multiples of 128, K%(2*blockK)==0.
 
     Returns
     -------
@@ -132,7 +133,15 @@ def pick_gemm_config(
         _dtype_bits(c_dtype),
     )
 
-    candidates = _pm.generate_candidates(prob, hw)
+    kt_str = (kernel_type or "standard").lower()
+    if kt_str == "gluon":
+        kt = _pm.KernelType.Gluon
+    elif kt_str in ("standard", "std"):
+        kt = _pm.KernelType.Standard
+    else:
+        raise ValueError(f"unknown kernel_type {kernel_type!r} (use 'standard' or 'gluon')")
+
+    candidates = _pm.generate_candidates(prob, hw, kernel_type=kt)
     if not candidates:
         return []
 

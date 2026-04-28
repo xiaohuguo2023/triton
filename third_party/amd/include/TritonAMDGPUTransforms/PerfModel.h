@@ -320,6 +320,19 @@ int selectGroupSizeM(const GemmProblem &prob, const TritonGemmConfig &cfg,
 int selectMfmaNonKDim(const GemmProblem &prob, const TritonGemmConfig &cfg,
                       const HardwareInfo &hw);
 
+/// Kernel-flavor selector for generateCandidates() / rankConfigs().
+///
+/// The standard triton matmul kernel is compiler-pipelined and supports a wide
+/// range of (numWarps, numStages, blockM/N/K) combinations. Gluon kernels
+/// (e.g. v9_beyond_hotloop) have structural constraints fixed at the layout
+/// level: warps_per_cta=[2,2] requires numWarps=4, the 4-quadrant accumulator
+/// requires blockM/blockN to be multiples of 128, and the loop-unrolled-by-2
+/// pipeline requires K to be divisible by 2*blockK.
+enum class KernelType {
+  Standard, ///< Compiler-pipelined triton matmul (full sweep)
+  Gluon,    ///< Hand-tuned gluon kernel with v9-style 4-quadrant + 2x unroll
+};
+
 /// Generate a candidate set of TritonGemmConfig tuples for a given problem
 /// and hardware target.
 ///
@@ -328,14 +341,24 @@ int selectMfmaNonKDim(const GemmProblem &prob, const TritonGemmConfig &cfg,
 ///   blockN = mfmaDim × waveTileN × waveCountN
 ///   blockK = multiple of the MFMA kDim from the throughput table
 ///
-/// numWarps is swept over {1, 2, 4, 8}. numStages is swept over {1, 2, 3, 4}.
+/// For KernelType::Standard:
+///   numWarps swept over {4, 8}; numStages swept over {1, 2, 3}.
+///   On CDNA4 (gfx950): forced to numWarps=8, numStages=2 (pingpong scheduler).
+///
+/// For KernelType::Gluon:
+///   numWarps fixed to 4 (warps_per_cta=[2,2] structural requirement).
+///   numStages fixed to 2 (gluon's hand-tuned 8-deep async pipeline).
+///   Tile constraints: blockM/blockN ≥ 128, divisible by 128 (4-quadrant);
+///   blockK % 32 == 0 (gfx950 MFMA kDim); K % (2*blockK) == 0; K/blockK ≥ 4.
+///
 /// All candidates are filtered through isValidConfig — only feasible configs
 /// (LDS fits, VGPR fits, kDim alignment) are returned.
 ///
 /// The returned list is unranked; pass it to rankConfigs() to sort by
 /// predicted TFLOPS.
 std::vector<TritonGemmConfig>
-generateCandidates(const GemmProblem &prob, const HardwareInfo &hw);
+generateCandidates(const GemmProblem &prob, const HardwareInfo &hw,
+                   KernelType kernelType = KernelType::Standard);
 
 } // namespace mlir::triton::AMD::perf
 
