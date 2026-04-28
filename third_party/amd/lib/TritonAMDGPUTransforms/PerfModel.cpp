@@ -1180,7 +1180,8 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
 //===----------------------------------------------------------------------===//
 
 std::vector<TritonGemmConfig>
-generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
+generateCandidates(const GemmProblem &prob, const HardwareInfo &hw,
+                   KernelType kernelType) {
   // Step 1: pick the MFMA instruction dimension using the throughput model.
   // Use a probe config (blockM=blockN=128) to let selectMfmaNonKDim run.
   // The result is arch+dtype specific and independent of tile size.
@@ -1242,6 +1243,15 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
   const int maxTile = 256;
   const int minTile = 2 * mfmaDim; // e.g. 32 for mfmaDim=16
 
+  // Gluon-specific tile constraints (v9_beyond_hotloop / v9_any_tile structural):
+  //   - blockM, blockN ≥ 128 (4-quadrant: BM/2 ≥ 64 for extract_slice)
+  //   - blockM, blockN multiples of 128
+  //   - blockK % 32 == 0 (gfx950 MFMA kDim for FP16)
+  //   - K % (2*blockK) == 0, K/blockK ≥ 4 (loop unrolled by 2, prologue needs 2 stages)
+  const bool isGluon = (kernelType == KernelType::Gluon);
+  const int gluonMinTile  = 128;
+  const int gluonTileStep = 128;
+
   std::vector<std::pair<int, int>> mnPairs;
   for (int wtM : waveTiles) {
     for (int wcM : waveCounts) {
@@ -1253,6 +1263,12 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
           int bN = mfmaDim * wtN * wcN;
           if (bN < minTile || bN > maxTile)
             continue;
+          if (isGluon) {
+            if (bM < gluonMinTile || bN < gluonMinTile)
+              continue;
+            if ((bM % gluonTileStep) != 0 || (bN % gluonTileStep) != 0)
+              continue;
+          }
           mnPairs.emplace_back(bM, bN);
         }
       }
@@ -1271,25 +1287,38 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw) {
   // consistently wins across all problem sizes (empirically validated vs
   // autotuner). Use a single value to avoid model picking nS=3 due to
   // over-optimistic pipeline overlap estimates.
+  // For Gluon: numWarps fixed to 4 (warps_per_cta=[2,2] structural),
+  // numStages fixed to 2 (gluon's hand-tuned 8-deep async pipeline).
   // On other archs: sweep the full range.
   const bool cdna4Only = (hw.arch == Arch::CDNA4);
-  const int numWarpsCandidates[]  = {4, 8};
-  const int numStagesCandidates[] = {1, 2, 3};
+
+  // Build candidate sweeps based on kernel type.
+  std::vector<int> numWarpsVec;
+  std::vector<int> numStagesVec;
+  if (isGluon) {
+    numWarpsVec  = {4};
+    numStagesVec = {2};
+  } else if (cdna4Only) {
+    numWarpsVec  = {8};
+    numStagesVec = {2};
+  } else {
+    numWarpsVec  = {4, 8};
+    numStagesVec = {1, 2, 3};
+  }
 
   // Step 5: enumerate all combinations and keep feasible ones.
-  // Reserve the theoretical upper bound to avoid reallocation.
   std::vector<TritonGemmConfig> candidates;
-  candidates.reserve(mnPairs.size() * blockKVec.size() *
-                     std::size(numWarpsCandidates) *
-                     std::size(numStagesCandidates));
+  candidates.reserve(mnPairs.size() * blockKVec.size() * numWarpsVec.size() *
+                     numStagesVec.size());
   for (auto [bM, bN] : mnPairs) {
     for (int bK : blockKVec) {
-      for (int nW : numWarpsCandidates) {
-        if (cdna4Only && nW != 8) // gfx950 requires nW=8 for pingpong
-          continue;
-        for (int nS : numStagesCandidates) {
-          if (cdna4Only && nS != 2) // gfx950: nS=2 wins empirically
-            continue;
+      // Gluon-specific K-loop constraints.
+      if (isGluon) {
+        if (prob.K % (2 * bK) != 0) continue;     // loop unrolled by 2
+        if (prob.K / bK < 4) continue;            // prologue needs ≥4 K iters
+      }
+      for (int nW : numWarpsVec) {
+        for (int nS : numStagesVec) {
           TritonGemmConfig cfg;
           cfg.blockM      = bM;
           cfg.blockN      = bN;
