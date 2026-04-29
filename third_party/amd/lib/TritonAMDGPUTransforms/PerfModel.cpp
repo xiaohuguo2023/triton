@@ -1321,7 +1321,7 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw,
   std::vector<int> numWarpsVec;
   std::vector<int> numStagesVec;
   if (isGluon) {
-    numWarpsVec  = {0};   // sentinel — actual value chosen per (bM, bN) below
+    numWarpsVec  = {};    // unused for Gluon — see gluonNumWarpsForTile below
     numStagesVec = {2};
   } else if (cdna4Only) {
     numWarpsVec  = {8};
@@ -1331,33 +1331,63 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw,
     numStagesVec = {1, 2, 3};
   }
 
-  auto gluonNumWarps = [](int bM, int bN) {
-    // Big tiles → v9_any_tile (4 warps); small tiles → v9_small_tile (1 warp).
-    return (bM >= 128 && bN >= 128) ? 4 : 1;
+  // For each (bM, bN) gluon tile, return the list of valid num_warps values.
+  // Each num_warps identifies a different gluon kernel binary (kernels are
+  // hand-written for one specific warps_per_cta), so this isn't a tuning
+  // sweep — it's "which kernels can compute this tile":
+  //   * num_warps=4 with BM,BN >= 128 (multiples of 128) → v9_any_tile
+  //   * num_warps=4 with BM,BN >= 32 (excluding the v9_any_tile range)
+  //                                                      → v9_small_tile_v2
+  //   * num_warps=1 with BM,BN ∈ {16,32}                 → v9_small_tile (v1)
+  // For 32×32 we propose BOTH 1-warp v1 and 4-warp v2 and let rankConfigs
+  // choose; v1 wins at small-M (less per-CTA overhead), v2 wins at large-M
+  // (more parallel waves per CU).
+  auto gluonNumWarpsForTile = [](int bM, int bN) -> std::vector<int> {
+    if (bM >= 128 && bN >= 128) return {4};                       // v9_any_tile
+    if (bM >= 32  && bN >= 32) {
+      if (bM == 32 && bN == 32) return {1, 4};                    // v1 AND v2
+      return {4};                                                  // v2 only
+    }
+    return {1};                                                    // v1 only
   };
 
   // Step 5: enumerate all combinations and keep feasible ones.
   std::vector<TritonGemmConfig> candidates;
-  candidates.reserve(mnPairs.size() * blockKVec.size() * numWarpsVec.size() *
+  candidates.reserve(mnPairs.size() * blockKVec.size() *
+                     (isGluon ? 2 : numWarpsVec.size()) *
                      numStagesVec.size());
   for (auto [bM, bN] : mnPairs) {
     for (int bK : blockKVec) {
-      // Gluon-specific K-loop constraints.
-      if (isGluon) {
-        const bool isBigTile = (bM >= 128 && bN >= 128);
-        if (isBigTile) {
-          if (prob.K % (2 * bK) != 0) continue;   // loop unrolled by 2
-          if (prob.K / bK < 4) continue;          // prologue needs ≥4 K iters
-        } else {
-          if (prob.K % bK != 0) continue;         // sync loop just needs divisibility
-          // v9_small_tile direct-to-LDS needs >=9 LDS bases (loadContig=8 + 64 lanes)
-          if ((bM * bK) < (1 << 9) || (bN * bK) < (1 << 9)) continue;
+      // Build per-tile num_warps list (gluon: kernel-specific; std: fixed).
+      const std::vector<int> tileNWs =
+          isGluon ? gluonNumWarpsForTile(bM, bN) : numWarpsVec;
+      for (int nW : tileNWs) {
+        // Per-(tile, num_warps) gluon K-loop constraints. Each kernel has its
+        // own pipeline shape and LDS-base requirements:
+        //   v9_any_tile (4w, BM,BN>=128): unroll-by-2 loop with prologue →
+        //     K%(2*BK)==0 AND K/BK >= 4.
+        //   v9_small_tile_v2 (4w medium): unroll-by-2 async pipeline →
+        //     K%BK==0 AND K/BK >= 4 AND even AND BM*BK >= 2^9 (LDS bases).
+        //   v9_small_tile (1w v1): sync loop → K%BK==0 AND BM*BK >= 2^9.
+        if (isGluon) {
+          const bool isAnyTile = (bM >= 128 && bN >= 128);
+          const bool isV2 = (nW == 4 && !isAnyTile);
+          const bool isV1 = (nW == 1);
+          if (isAnyTile) {
+            if (prob.K % (2 * bK) != 0) continue;
+            if (prob.K / bK < 4) continue;
+          } else if (isV2) {
+            if (prob.K % bK != 0) continue;
+            if (prob.K / bK < 4) continue;
+            if ((prob.K / bK) % 2 != 0) continue;
+            if ((bM * bK) < (1 << 9) || (bN * bK) < (1 << 9)) continue;
+          } else if (isV1) {
+            if (prob.K % bK != 0) continue;
+            if ((bM * bK) < (1 << 9) || (bN * bK) < (1 << 9)) continue;
+          } else {
+            continue; // unknown gluon (BM,BN,num_warps) combination
+          }
         }
-      }
-      for (int nW : numWarpsVec) {
-        // For Gluon, override the placeholder 0 with tile-specific num_warps.
-        if (isGluon)
-          nW = gluonNumWarps(bM, bN);
         for (int nS : numStagesVec) {
           TritonGemmConfig cfg;
           cfg.blockM      = bM;
