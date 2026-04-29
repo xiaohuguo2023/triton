@@ -342,6 +342,16 @@ std::string translateLLVMIRToASM(llvm::Module &module,
     setLLVMOption<bool>("print-after-all", true);
   }
 
+  // When the AMD LLIR scheduler is enabled, we must disable LLVM's
+  // pre-RA and post-RA MachineScheduler so they don't undo the LLIR
+  // scheduler's interleaving.
+  std::optional<ScopedLLVMOption<bool>> mischedOff;
+  std::optional<ScopedLLVMOption<bool>> postMischedOff;
+  if (triton::tools::getBoolEnv("TRITON_ENABLE_LLIR_SCHED")) {
+    mischedOff.emplace("enable-misched", false);
+    postMischedOff.emplace("enable-post-misched", false);
+  }
+
   bool disableLLVMOpt = triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (!disableLLVMOpt) {
     // Check to see if we are passing a list of flags to disable optimizations.

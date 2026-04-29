@@ -491,6 +491,9 @@ class HIPBackend(BaseBackend):
         if knobs.amd.scalarize_packed_fops:
             amd.add_scalarize_packed_fops_llvm_pass(kernel_fn)
 
+        if os.environ.get("TRITON_ENABLE_LLIR_SCHED"):
+            amd.add_llir_schedule_pass(kernel_fn, options.arch)
+
         # Get some metadata
         metadata["num_warps"] = total_warps_num
         metadata["shared"] = src.get_int_attr("ttg.shared")
