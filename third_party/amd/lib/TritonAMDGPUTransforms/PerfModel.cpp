@@ -1015,10 +1015,21 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // For memory-bound kernels, use VGPR-only occupancy (vgprOccupancy) rather
   // than the combined est.occupancy. LDS-limited occupancy reflects larger
   // pipeline buffers — beneficial for overlap, not a performance constraint.
-  // Cap at 2× (min effective occupancy = 0.5) to avoid over-penalising.
-  double occupancyPenalty = est.isComputeBound
-                                ? 1.0
-                                : (1.0 / std::max(vgprOccupancy, 0.5));
+  //
+  // Saturation point: occupancy only matters until you have enough resident
+  // waves to keep HBM busy through the issue queue. Empirically ~4 waves per
+  // SIMD is sufficient (~0.5 of maxWavesPerSimd=8 on gfx950); past that,
+  // additional waves don't reduce HBM time. Without this cap, the penalty
+  // continuously rewards higher occupancy and structurally favours small
+  // tiles (more waves resident) over large tiles (fewer but with the same
+  // effective HBM saturation), even when the larger tile actually has much
+  // lower per-output HBM traffic.
+  const double saturationOccupancy =
+      4.0 / std::max(hw.maxWavesPerSimd, 1);
+  const double effectiveVgprOcc = std::min(vgprOccupancy, saturationOccupancy);
+  double occupancyPenalty =
+      est.isComputeBound ? 1.0
+                         : (1.0 / std::max(effectiveVgprOcc, 0.25));
 
   double totalCycles = est.effectiveTileCycles * est.numWaves * occupancyPenalty;
   // Apply wave-tail efficiency.
