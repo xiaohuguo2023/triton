@@ -961,8 +961,12 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
       (cfg.numWarps > 0) ? blockSizeBytes / cfg.numWarps : blockSizeBytes;
 
   // Effective in-flight depth: TCP cap limits how many per-wave requests fit.
-  // numActiveWaves = est.wavesPerSimd × numSimdPerCU (VGPR-limited only).
-  const int numActiveWaves = std::max(1, static_cast<int>(vgprOccupancy * hw.numSimdPerCU * hw.maxWavesPerSimd));
+  // Only the numWarps waves of ONE CTA simultaneously issue loads for the
+  // current K-block; co-resident CTAs are at different K-iters in their async
+  // pipeline and don't compete for the same TCP entries. Counting all
+  // VGPR-resident waves on the CU (the previous formula) wrongly penalised
+  // higher-occupancy tiles by dividing TCP capacity among non-competing waves.
+  const int numActiveWaves = std::max(1, cfg.numWarps);
   const double tcpDepth = (dataPerWave > 0.0 && numActiveWaves > 0)
                               ? tcpSizeBytes / (numActiveWaves * dataPerWave)
                               : static_cast<double>(cfg.numStages - 1);
