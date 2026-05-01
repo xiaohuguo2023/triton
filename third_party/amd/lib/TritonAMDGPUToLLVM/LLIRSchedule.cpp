@@ -91,16 +91,56 @@ struct MFMARegionCollectResult {
 
 struct Utils {
   static Loop *findMainLoop(LoopInfo &LI) {
+    // Find the loop that *directly* contains the most MFMA intrinsics.
+    // Recurses into nested loops so that for persistent kernels (outer tile
+    // loop containing the K-loop), the inner K-loop is chosen rather than
+    // the outer one. Counting only BBs that belong to L itself (not its
+    // subloops, via LI.getLoopFor(BB) == L) ensures the outer loop's score
+    // doesn't include the inner loop's MFMAs, so the inner loop wins.
     Loop *mainLoop = nullptr;
-    size_t maxInsts = 0;
+    size_t maxScore = 0;
 
-    for (Loop *L : LI) {
-      size_t instCount = 0;
-      for (BasicBlock *BB : L->blocks())
-        instCount += BB->size();
-      if (instCount > maxInsts) {
-        maxInsts = instCount;
+    SmallVector<Loop *, 8> Worklist;
+    for (Loop *L : LI)
+      Worklist.push_back(L);
+
+    while (!Worklist.empty()) {
+      Loop *L = Worklist.pop_back_val();
+      for (Loop *Sub : L->getSubLoops())
+        Worklist.push_back(Sub);
+
+      size_t score = 0;
+      for (BasicBlock *BB : L->blocks()) {
+        if (LI.getLoopFor(BB) != L)
+          continue;
+        for (Instruction &I : *BB) {
+          if (auto *CI = dyn_cast<CallInst>(&I)) {
+            if (Function *Callee = CI->getCalledFunction()) {
+              if (Callee->isIntrinsic() &&
+                  Callee->getName().contains("mfma"))
+                score++;
+            }
+          }
+        }
+      }
+      if (score > maxScore) {
+        maxScore = score;
         mainLoop = L;
+      }
+    }
+
+    // Fallback: if no MFMAs found anywhere, preserve the original
+    // "loop with most instructions" behaviour for non-MFMA kernels.
+    if (!mainLoop) {
+      size_t maxInsts = 0;
+      for (Loop *L : LI) {
+        size_t instCount = 0;
+        for (BasicBlock *BB : L->blocks())
+          instCount += BB->size();
+        if (instCount > maxInsts) {
+          maxInsts = instCount;
+          mainLoop = L;
+        }
       }
     }
     return mainLoop;
@@ -238,6 +278,106 @@ struct Utils {
 
   static bool isSinkTransparentInst(const Instruction &I) {
     return isa<ExtractElementInst>(I);
+  }
+
+  // Walk back through Hoist/Sink-transparent instructions (ShuffleVector /
+  // InsertElement / ExtractElement) to find the originating MFMA that
+  // ultimately defines V. Returns nullptr if no MFMA in the same BB.
+  static Instruction *findOriginatingMFMA(Value *V, BasicBlock *BB) {
+    SmallPtrSet<Value *, 16> Visited;
+    while (V && Visited.insert(V).second) {
+      auto *I = dyn_cast<Instruction>(V);
+      if (!I || I->getParent() != BB)
+        return nullptr;
+      if (isMFMAorWMMA(*I))
+        return I;
+      if (isHoistTransparentInst(*I) || isSinkTransparentInst(*I)) {
+        // Follow value-producing operand chain.
+        // For ShuffleVector / Insert / Extract, the relevant value is op 0.
+        if (I->getNumOperands() == 0)
+          return nullptr;
+        V = I->getOperand(0);
+        continue;
+      }
+      return nullptr;
+    }
+    return nullptr;
+  }
+
+  // Count the number of independent MFMA accumulation chains in a region.
+  // For each MFMA, follow its accumulator operand (operand 2 of the
+  // amdgcn.mfma intrinsic) back through any transparent insts to its
+  // originating MFMA. MFMAs whose acc traces back to another MFMA in the
+  // same BB are "chained"; MFMAs whose acc starts fresh (e.g. from a
+  // PHI/zero/cross-BB value) are "chain heads". The number of chain heads
+  // equals the number of parallel chains.
+  //
+  // Why this matters: LLIR's Hoist/Sink/spacing heuristics
+  // (preprocessMFMAInstsInRegion + scheduleMFMAWithSpacing) assume the
+  // kernel emits MULTIPLE parallel MFMA chains (matching v9_any_tile's
+  // 4-quadrant decomposition). For single-chain kernels (v9_small_tile_v2,
+  // v9_persistent_v1 single-tile), the heuristics force chain splitting
+  // that materializes many MFMA results live simultaneously, blowing VGPR
+  // pressure (~16 results × 4 VGPRs each = +64 VGPR observed at BM=BN=128,
+  // dropping occupancy 3 → 2 waves/SIMD on gfx950 = -9% perf).
+  //
+  // Caller should skip LLIR scheduling when this returns 1.
+  static unsigned countMFMAChains(const BBRegion &R) {
+    unsigned mfmaCount = 0;
+    unsigned chainedCount = 0;
+    for (Instruction &I : Utils::instructionsInRegion(R)) {
+      if (!isMFMAorWMMA(I))
+        continue;
+      mfmaCount++;
+      auto *CI = dyn_cast<CallInst>(&I);
+      // amdgcn.mfma intrinsic acc operand is index 2.
+      if (CI && CI->arg_size() >= 3) {
+        if (findOriginatingMFMA(CI->getArgOperand(2), R.BB))
+          chainedCount++;
+      }
+    }
+    if (mfmaCount == 0)
+      return 0;
+    return mfmaCount - chainedCount;
+  }
+
+  // Returns true if moving Def after NewPos would push Def past one of its
+  // (transitive, transparent) users in the same basic block — which would
+  // produce an SSA dominance violation.
+  //
+  // Walks Def's user closure through ShuffleVector / Insert / Extract since
+  // those are the "transparent" pass-through patterns the scheduler treats as
+  // fungible. If any such user is at-or-before NewPos in the same BB, the
+  // move is unsafe.
+  //
+  // Background: the persistent-kernel straight-line code path (single-tile
+  // fast path) flattens K-loop body and output-shuffle chain into ONE basic
+  // block. This means MFMA-result shufflevectors live in the same region as
+  // anchors that the scheduler picks as moveAfter targets. Without this
+  // guard, moveMFMAsAfter() can move an MFMA past one of its own consuming
+  // shufflevectors, breaking SSA dominance.
+  static bool wouldCreateBackwardEdge(Instruction *Def, Instruction *NewPos) {
+    if (!Def || !NewPos)
+      return false;
+    BasicBlock *BB = NewPos->getParent();
+    SmallVector<Value *, 8> Worklist{Def};
+    SmallPtrSet<Value *, 16> Visited;
+    while (!Worklist.empty()) {
+      Value *V = Worklist.pop_back_val();
+      if (!Visited.insert(V).second)
+        continue;
+      for (User *U : V->users()) {
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI || UI->getParent() != BB)
+          continue;
+        if (UI == NewPos || UI->comesBefore(NewPos))
+          return true;
+        if (Utils::isHoistTransparentInst(*UI) ||
+            Utils::isSinkTransparentInst(*UI))
+          Worklist.push_back(UI);
+      }
+    }
+    return false;
   }
 
   static SchedKind classifySchedInst(Instruction &I) {
@@ -928,11 +1068,23 @@ private:
   // moveAfter naturally produces correct order: each new MFMA goes right
   // after InsertPt, pushing previous ones further away.
   // Result: InsertPt, MFMA[N-K], ..., MFMA[N-2], MFMA[N-1]
+  //
+  // Skips any MFMA whose move would push it past one of its same-BB
+  // transparent users — that would break SSA dominance. The skipped MFMA
+  // remains in MFMAInsts (MFMAIdx is not decremented) so it stays
+  // available for future moves to safer positions.
   static unsigned moveMFMAsAfter(SmallVectorImpl<Instruction *> &MFMAInsts,
                                  unsigned &MFMAIdx, unsigned Count,
                                  Instruction *InsertPt) {
     unsigned moved = 0;
     for (unsigned j = 0; j < Count && MFMAIdx > 0; ++j) {
+      Instruction *MFMA = MFMAInsts[MFMAIdx - 1];
+      if (Utils::wouldCreateBackwardEdge(MFMA, InsertPt)) {
+        // Stop sinking from this batch — earlier MFMAs in the array are
+        // by program-order earlier and would be even more likely to
+        // violate dominance if moved past InsertPt.
+        break;
+      }
       MFMAInsts[--MFMAIdx]->moveAfter(InsertPt);
       moved++;
     }
@@ -1158,6 +1310,29 @@ private:
         bbR.Begin = Regions[i].Barrier;
         bbR.End = (i + 1 < NumRegions) ? Regions[i + 1].Barrier : nullptr;
 
+        // Skip LLIR's heavy reordering when the region's MFMA chain count
+        // exceeds what scheduleMFMAWithSpacing's heuristics can space
+        // properly (the hardcoded mfmaPerGR is currently 4, calibrated for
+        // v9_any_tile's 4-quadrant decomposition). When chainHeads > 4 (e.g.
+        // v9_small_tile_v2's warp-tiled body has ~15 sub-chains per K-block),
+        // the scheduler's chain-distribution assumptions break: 4 chains'
+        // worth of MFMAs are interleaved with anchors, the remaining
+        // chainHeads-4 chains' MFMAs pile up at the front (leftover), and
+        // the resulting reorder materializes many MFMA results live
+        // simultaneously — +64 VGPR observed at BM=BN=128 → -9% perf.
+        //
+        // Also skip the chainHeads <= 1 case (region with no real MFMA chain)
+        // since there's nothing for the scheduler to space.
+        constexpr unsigned kHeuristicMaxChains = 4;
+        unsigned chainHeads = Utils::countMFMAChains(bbR);
+        if (chainHeads <= 1 || chainHeads > kHeuristicMaxChains) {
+          LLVM_DEBUG(dbgs() << "Skipping region " << i
+                            << " (chainHeads=" << chainHeads
+                            << " outside heuristic range [2, "
+                            << kHeuristicMaxChains << "])\n");
+          continue;
+        }
+
         MFMARegionCollectResult Res = preprocessMFMAInstsInRegion(bbR);
 
         // --- Build region comment ---
@@ -1377,6 +1552,16 @@ private:
         dbgs() << " " << RunCount << " " << schedKindName(RunKind);
       dbgs() << "\n";
     });
+
+    // Same single-chain / over-fan guard as scheduleBB: skip when chain
+    // count is outside the heuristic range. See countMFMAChains() comment.
+    constexpr unsigned kHeuristicMaxChains = 4;
+    unsigned chainHeads = Utils::countMFMAChains(bbR);
+    if (chainHeads <= 1 || chainHeads > kHeuristicMaxChains) {
+      LLVM_DEBUG(dbgs() << "Skipping epilogue region (chainHeads="
+                        << chainHeads << " outside heuristic range)\n");
+      return;
+    }
 
     // Schedule WMMAs in this epilogue region
     scheduleEpilogueRegion(Res.Anchors, Res.MFMAInsts, bbR);
