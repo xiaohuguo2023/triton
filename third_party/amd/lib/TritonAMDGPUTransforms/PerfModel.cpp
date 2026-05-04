@@ -876,9 +876,15 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
         static_cast<int64_t>(ceildiv(cfg.blockM, info.mDim)) *
         ceildiv(cfg.blockN, info.nDim) *
         ceildiv(cfg.blockK, info.kDim);
+    // SIMD utilization: each warp runs on one SIMD; if numWarps < numSimdPerCU
+    // and only one CTA fits per CU, the unused SIMDs sit idle for this tile.
+    // Without this correction, nw=1 gets unfairly rewarded at small shapes
+    // (model assumes all 4 SIMDs always work on the tile).
+    const int activeSimdsPerCTA =
+        std::max(1, std::min(cfg.numWarps, hw.numSimdPerCU));
     est.computeCycles =
         static_cast<double>(numMfmaPerKBlock) * numKIter
-        * info.throughputCycles / hw.numSimdPerCU;
+        * info.throughputCycles / activeSimdsPerCTA;
   } else {
     // Fallback: full GEMM FLOPs for this output tile.
     est.computeCycles =
