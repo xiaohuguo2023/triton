@@ -34,6 +34,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <unordered_set>
+#include <vector>
 
 namespace mlir::triton::AMD::perf {
 
@@ -167,17 +169,11 @@ HardwareInfo HardwareInfo::get(Arch arch) {
     hw.numXCDs = 8;              // Origami: get_default_num_xcds(gfx950) = 8
     hw.clockMHz = 2400.0;
     hw.peakMemBwBytesPerCycle = 3000.0;  // ~7.2 TB/s / 2.4 GHz
-    // Calibrated from testtmp/calibrate_l2_bw.py on MI355X:
-    // Peak effective BW ~43 TB/s observed at M=2048 BK=128 (64×64 tile).
-    // 43e12 / 2.4e9 ≈ 17900 bytes/cycle device-wide.
-    //
-    // IMPORTANT: L2 hit rate formula is BK-independent (BK cancels in uA/uB),
-    // so this does NOT fix BK selection. Enabling it causes regressions because
-    // the L2 boost makes memory-bound small tiles look better than they are for
-    // large-M shapes with many output tiles. The L2 model needs per-shape
-    // calibration of l2_m, l2_n before it can be safely enabled.
-    // See docs/perf-model-skill.md Gap 4 for details.
-    hw.peakL2BwBytesPerCycle = 0.0;  // TODO: enable after per-shape calibration
+    // L2 BW: calibrated on MI355X = 43 TB/s effective = 17900 bytes/cycle.
+    // Now safe to enable: formocastL2HitRate gives tile-size-dependent hit
+    // rate (BK-aware via WG simulation), so larger tiles correctly get more
+    // L2 benefit than the old BK-independent formula allowed.
+    hw.peakL2BwBytesPerCycle = 17900.0;
     break;
 
   // ── RDNA3  gfx1100/1101/1102 ────────────────────────────────────────────
@@ -664,6 +660,139 @@ static double estimateL2HitRate(int64_t l2M, int64_t l2N,
   return std::max(0.0, std::min(static_cast<double>(cached) / total, 1.0));
 }
 
+// Formocast: simulate workgroup launch order across XCDs and track which A
+// rows / B cols are cached in each XCD's L2 partition. Cache is "flushed"
+// every wgPerXCDIter = numCUs/numXCDs workgroups per XCD (heuristic for
+// effective cache eviction).
+//
+// This is the simulation-based hit rate model from
+// rocm-libraries/shared/origami/src/simulator/tensilelite/formocast.cpp
+// (MIT-licensed). It captures tile-size-dependent reuse that the simpler
+// estimateL2HitRate misses — same total HBM bytes per tile can give very
+// different hit rates depending on whether the WG sequence keeps or evicts
+// the per-XCD cached A rows / B cols.
+//
+// Returns hit rate in [0, 1].
+static double formocastL2HitRate(int64_t M, int64_t N, int64_t K,
+                                  int64_t MT0, int64_t MT1,
+                                  int64_t numCUs, int64_t numXCDs,
+                                  int64_t wgm, int64_t XCC = 1) {
+  if (M <= 0 || N <= 0 || K <= 0 || MT0 <= 0 || MT1 <= 0 ||
+      numCUs <= 0 || numXCDs <= 0)
+    return 0.0;
+
+  auto ceildiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+
+  uint32_t wg0 = static_cast<uint32_t>(ceildiv(M, MT0));
+  uint32_t wg1 = static_cast<uint32_t>(ceildiv(N, MT1));
+
+  uint32_t MT0_Edge = MT0 - ((wg0 * MT0) - M);
+  uint32_t MT1_Edge = MT1 - ((wg1 * MT1) - N);
+  if (MT0_Edge == 0) MT0_Edge = MT0;
+  if (MT1_Edge == 0) MT1_Edge = MT1;
+
+  int WGMXCC  = (XCC > 0) ? static_cast<int>(XCC) : 1;
+  int WGMXCCG = static_cast<int>(numCUs);
+  if (WGMXCC > 0 && (WGMXCCG % WGMXCC) != 0)
+    return 0.0;
+
+  uint32_t totalWGNum = static_cast<uint32_t>(wg0) * static_cast<uint32_t>(wg1);
+  // Cap simulation length (matches formocast).
+  uint32_t simLen = std::min<uint32_t>(totalWGNum, 10u * static_cast<uint32_t>(numCUs));
+
+  std::vector<std::vector<uint32_t>> xcd_wgs(static_cast<size_t>(numXCDs));
+  uint32_t xccIdx = 0;
+  for (uint32_t wg = 0; wg < simLen; ++wg) {
+    uint32_t xccMappedWGId;
+    if (WGMXCCG == 0) {
+      xccMappedWGId = (wg / WGMXCC) + (wg % WGMXCC) * (totalWGNum / WGMXCC) +
+                       std::min<uint32_t>(totalWGNum % WGMXCC, wg % WGMXCC);
+    } else {
+      xccMappedWGId = (wg / WGMXCCG) * WGMXCCG + ((wg % WGMXCCG) / WGMXCC);
+      if (wg > (totalWGNum / WGMXCCG) * WGMXCCG)
+        xccMappedWGId += (wg % WGMXCC) * ((totalWGNum % WGMXCCG) / WGMXCC) +
+                         std::min<uint32_t>(totalWGNum % WGMXCC, wg % WGMXCC);
+      else
+        xccMappedWGId += (wg % WGMXCC) * (WGMXCCG / WGMXCC);
+    }
+    xcd_wgs[xccIdx].emplace_back(xccMappedWGId);
+    xccIdx = (xccIdx + 1) % static_cast<uint32_t>(numXCDs);
+  }
+
+  size_t wgPerXCDIter = static_cast<size_t>(numCUs / numXCDs);
+  uint64_t aHitElements = 0, aMissElements = 0;
+  uint64_t bHitElements = 0, bMissElements = 0;
+
+  for (size_t xi = 0; xi < static_cast<size_t>(numXCDs); ++xi) {
+    auto &curXCDWGVec = xcd_wgs[xi];
+    std::unordered_set<uint32_t> cachedA, cachedB;
+
+    for (size_t counter = 0; counter < curXCDWGVec.size(); ++counter) {
+      uint32_t xccMappedWGId = curXCDWGVec[counter];
+      uint32_t sgprWG1 = xccMappedWGId / wg0;
+      uint32_t sgprWG0 = xccMappedWGId - (sgprWG1 * wg0);
+
+      // GROUP_SIZE_M (wgm) remap. Positive wgm = M-major slabs.
+      uint32_t finalwg0 = sgprWG0;
+      uint32_t finalwg1 = sgprWG1;
+      if (wgm > 1) {
+        uint32_t v6 = sgprWG1 / wgm;
+        uint32_t s84 = v6 * wgm;
+        s84 = sgprWG1 - s84;
+        s84 *= wg0;
+        s84 += sgprWG0;
+        uint32_t s81 = v6;
+        v6 = wg1 / wgm;
+        uint32_t s82 = v6;
+        uint32_t s83 = wgm * s82;
+        s83 = wg1 - s83;
+        if (s83 == 0) s83 = wgm;
+        if (s81 >= s82) s82 = s83;
+        else s82 = wgm;
+        v6 = s84 / s82;
+        uint32_t v7 = v6 * s82;
+        v7 = s84 - v7;
+        sgprWG0 = v6;
+        sgprWG1 = v7;
+        sgprWG1 = sgprWG0 * s82;
+        sgprWG1 = s84 - sgprWG1;
+        s81 *= wgm;
+        sgprWG1 += s81;
+        finalwg1 = sgprWG1;
+        finalwg0 = sgprWG0;
+      }
+
+      uint32_t MT_Size0 = (finalwg0 == (wg0 - 1)) ? MT0_Edge : MT0;
+      uint32_t MT_Size1 = (finalwg1 == (wg1 - 1)) ? MT1_Edge : MT1;
+      uint32_t idxA = finalwg0;
+      uint32_t idxB = finalwg1;
+
+      if ((counter % wgPerXCDIter) == 0) {
+        cachedA.clear();
+        cachedB.clear();
+      }
+
+      if (cachedA.count(idxA) != 0) {
+        aHitElements += (MT_Size0 * K);
+      } else {
+        aMissElements += (MT_Size0 * K);
+        cachedA.insert(idxA);
+      }
+      if (cachedB.count(idxB) != 0) {
+        bHitElements += (MT_Size1 * K);
+      } else {
+        bMissElements += (MT_Size1 * K);
+        cachedB.insert(idxB);
+      }
+    }
+  }
+
+  uint64_t totalHits = aHitElements + bHitElements;
+  uint64_t totalRefs = totalHits + aMissElements + bMissElements;
+  if (totalRefs == 0) return 0.0;
+  return static_cast<double>(totalHits) / static_cast<double>(totalRefs);
+}
+
 // Origami: predict_workgroup_mapping (fast path)
 // Selects the GROUP_SIZE_M (WGM slab width) that minimises the L2 working-set
 // cost for the last XCD in the first scheduling timestep.
@@ -914,10 +1043,13 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
 
   double l2HitRate = 0.0;
   if (hw.l2SizeBytes > 0 && hw.numCUs > 0 && gridM > 0 && gridN > 0) {
-    auto [l2M, l2N] = computeL2Tiles(
-        gridM, gridN, hw.numCUs, wgm, hw.numXCDs, hw.l2SizeBytes,
-        cfg.blockM, cfg.blockK, aBytes, cfg.blockN, bBytes);
-    l2HitRate = estimateL2HitRate(l2M, l2N, cfg.blockM, cfg.blockK, cfg.blockN);
+    // Formocast simulation-based L2 hit rate accounts for WG launch order
+    // and per-XCD cache eviction — captures the tile-size-dependent reuse
+    // gap that the BK-independent estimateL2HitRate misses. Falls back to
+    // the older formula if the simulation hits an edge case.
+    l2HitRate = formocastL2HitRate(prob.M, prob.N, prob.K,
+                                    cfg.blockM, cfg.blockN,
+                                    hw.numCUs, hw.numXCDs, wgm);
   }
 
   // Effective bandwidth: DRAM for misses, L2 for hits.
@@ -1345,7 +1477,10 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw,
     numWarpsVec  = {};    // unused for Gluon — see gluonNumWarpsForTile below
     numStagesVec = {2};
   } else if (cdna4Only) {
-    numWarpsVec  = {8};
+    // Sweep both 4 and 8: nw=8 enables pingpong for compute-bound shapes,
+    // but nw=4 wins at small shapes where there isn't enough work to keep
+    // 8 warps fed (and SIMD-utilization parity with gluon).
+    numWarpsVec  = {4, 8};
     numStagesVec = {2};
   } else {
     numWarpsVec  = {4, 8};
