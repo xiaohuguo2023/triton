@@ -809,11 +809,13 @@ int selectGroupSizeM(const GemmProblem &prob, const TritonGemmConfig &cfg,
   if (gridM <= 1 || gridN <= 1 || numMTs <= numXCD)
     return 1;
 
-  // Large grids: solution is insensitive → use sqrt(N_CU/numXCD)
-  const int64_t gridThreshold = static_cast<int64_t>(std::sqrt(static_cast<double>(N_CU)));
-  if (gridM > gridThreshold && gridN > gridThreshold)
-    return static_cast<int>(std::ceil(std::sqrt(static_cast<double>(N_CU / numXCD))));
-
+  // NOTE (Fix 3, 2026-06-06): removed the "large grids insensitive" shortcut
+  // that returned ceil(sqrt(N_CU/numXCD))=6 without evaluating alternatives.
+  // Empirical regression case: 4096×5120×2880 with (128,128) tile —
+  // shortcut returned GM=6 (predicted=1258 tf, measured=687 tf), while
+  // autotune picked GM=4 (measured=839 tf, +22%). The "insensitive"
+  // assumption was wrong; we now always run the cost-eval loop below.
+  // The loop is cheap (bitmask + a few arithmetic ops per candidate).
   const int64_t wgsPerXcd = std::min((numMTs + numXCD - 1) / numXCD, cuPerXcd);
 
   // Enough work + small N → use grid_n directly
@@ -1132,16 +1134,13 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
           : 1.0;
   est.pipelineOverlap = std::max(0.0, pipelineOverlapGluon);
 
-  // Effective tile cycles: compute dominates, memory visible only to the
-  // extent it is not hidden by pipelining.
+  // Effective tile cycles: compute is always paid, plus any unhidden memory
+  // serializes on top. (Fix 2 attempt 2026-06-06 — under investigation.)
   double hiddenMemCycles = est.memoryCycles * est.pipelineOverlap;
-  est.effectiveTileCycles =
-      std::max(est.computeCycles, est.memoryCycles - hiddenMemCycles);
+  double unhiddenMemCycles = std::max(0.0, est.memoryCycles - hiddenMemCycles);
+  est.effectiveTileCycles = est.computeCycles + unhiddenMemCycles;
 
-  // isComputeBound based on EFFECTIVE cycles (after pipeline overlap), not raw.
-  // A kernel pipelined enough to hide memory latency is compute-bound even if
-  // raw memoryCycles > computeCycles.
-  est.isComputeBound = (est.effectiveTileCycles <= est.computeCycles * 1.05);
+  est.isComputeBound = (unhiddenMemCycles <= est.computeCycles * 0.05);
 
   // ── Step 5: Predicted throughput ──────────────────────────────────────────
   //
@@ -1173,9 +1172,14 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
       est.isComputeBound ? 1.0
                          : (1.0 / std::max(effectiveVgprOcc, 0.25));
 
+  // Fix 1 final (2026-06-06): use est.numWaves directly (ceildiv of totalTiles
+  // by numCUs). This is the correct wall-clock count of wave passes — the
+  // partial last wave still takes full computeCycles even with some CUs idle.
+  // Original code divided by waveEfficiency (double-penalty for partial wave);
+  // earlier attempt used `max(1.0, ratio)` (correct for under-fill but lost the
+  // partial-wave wall-clock cost in the 1<ratio<2 regime). ceildiv handles
+  // both correctly: under-fill → 1 wave's wall-clock, well-fed → ceil count.
   double totalCycles = est.effectiveTileCycles * est.numWaves * occupancyPenalty;
-  // Apply wave-tail efficiency.
-  totalCycles /= std::max(1e-6, est.waveEfficiency);
 
   double totalFlops = 2.0 * prob.M * prob.N * prob.K * prob.batchSize;
 

@@ -219,6 +219,117 @@ is already the right abstraction point: extend it with a more general
 `KernelCostModel` that counts ops from the MLIR module rather than assuming
 a GEMM structure.
 
+A fourth approach — DSL-driven templates — is discussed in the Related Work
+section below (ThroughputSolver), with concrete ideas worth borrowing.
+
+---
+
+## Related Work: ThroughputSolver
+
+ThroughputSolver (https://github.com/AMD-internal/ThroughputSolver, C++) is a
+single-workgroup symbolic cost-function generator. Two text DSLs (arch.txt for
+hardware, kernel.txt for the kernel description) feed a dependency-graph engine
+that emits a *readable Python cost function*.
+
+This is a different design point from our PerfModel, with both strengths and
+gaps worth understanding before we generalise beyond GEMM.
+
+### What it is, concretely
+
+**Architecture DSL** (`test/arch.txt`):
+```
+MemoryPath hbm lds 512 500      # bw=512 B/cycle, latency=500 cycles
+MemoryPath lds vgpr 512 40
+Matrix FP16 FP16 FP32 32768     # MFMA throughput
+Coexecution Matrix FP16 FP16 FP32 3 4   # 75% vector/matrix overlap
+```
+
+**Kernel DSL** (`test/gemm.txt`):
+```
+For itrs
+  A_lds = MatrixMove M K hbm lds FP16 4 <ALoopLoadLds>
+  B_lds = MatrixMove K N hbm lds FP16 4 <BLoopLoadLds>
+  A = MatrixMove M K lds vgpr FP16 2 <ALoopLoadVgpr>
+  B = MatrixMove K N lds vgpr FP16 2 <BLoopLoadVgpr>
+  S = Mma A B C FP16 FP16 FP32 <Mma>
+EndFor
+Wait all
+```
+
+**Engine internals**:
+- Dependency DAG with explicit `producers/consumers` (data deps) and
+  `pipelineProducers` (hardware pipeline deps).
+- Symbolic parameter algebra (`Fixed`, `Optimisable`, `{Div, Sub, Min, Max, Sum, Prod}`
+  composites).
+- Output: a Python function that takes optimisable parameters as arguments
+  and returns the cycle count. The function is human-readable — you can see
+  exactly which path the critical-path analysis picks for each operation.
+
+Their flash-attention example (`test/fwd_atten.txt`) describes the full forward
+pass — Q/K/V loads, QK^T, softmax (Sub/Exp/Mul), PV, write-out — in ~30 lines
+of DSL.
+
+### What's worth borrowing
+
+| Idea | Benefit for our PerfModel | Effort |
+|---|---|---|
+| **Symbolic cost function as output** | Today `estimatePerf()` returns one `PerfEstimate{}`. A parallel symbolic-tree mode would let us debug *why* config A beats B, share readable formulas with users, and enable sensitivity analysis (change one param, see propagation). | Medium — wrap existing C++ formulas in a symbolic builder; keep numeric path for callers that don't need it. |
+| **Kernel-description DSL** | Adding attention/conv/MoE today requires C++ code in `generateCandidates` + a new `KernelType`. A DSL would let us describe new kernel patterns in ~30 lines of text. Pairs naturally with generalisation approach (2) above. | Large — parser + DAG builder + integration with our wave-quant layer. |
+| **Architecture DSL** | Adding MI400 today means editing `HardwareInfo::get()` in C++. A DSL would let us add an arch by editing a text file. | Medium — `HardwareInfo` is already a struct; needs a parser. |
+| **Explicit pipeline DAG with `pipelineProducers`** | Today our model is closed-form (roofline + corrections). A DAG simulation would capture async-copy pipelines + `s_waitcnt` placement more precisely. | Large — would replace formulas with a simulator; not clear it's worth the rewrite given our corrections already capture most of the effect. |
+| **`Coexecution` ratios** | Today MFMA-vs-vector overlap is implicit in the roofline. Explicit ratios in `HardwareInfo` would be cleaner and easier to recalibrate per arch. | Small — add a co-execution table. |
+| **`Wait`-as-node modelling** | Today `s_waitcnt` is counted *after* compilation, from AMDGCN. ThroughputSolver models `Wait` as a first-class DAG node. Could improve predictions for kernels with explicit synchronization patterns. | Large. |
+
+### What ThroughputSolver doesn't do (and we do)
+
+ThroughputSolver is a **single-workgroup critical-path model**. It does not model:
+
+- Wave-quantization / occupancy correction (our `stallAmp`, `wavesPerSimd` math).
+- Bank conflicts and LDS-padding accounting.
+- Multi-XCD L2 cache simulation (our `formocastL2HitRate`).
+- TCP-cap pipeline modelling (our Gluon-specific single-chain model).
+- VGPR pressure estimation — there is no register model at all.
+- MFMA-specific quirks (kBase, kWidth, dot-operand layout).
+
+These are precisely the GPU-level effects that determine ranking accuracy in
+our domain. ThroughputSolver's strength is per-workgroup latency analysis from
+pseudocode; ours is GPU-scale ranking from a fixed kernel family.
+
+### Recommendation: augment, don't replace
+
+The two systems are complementary, not competing. A pragmatic integration path:
+
+1. **Adopt symbolic-output mode first** (smallest change, highest debuggability
+   payoff). Wrap our existing `estimatePerf()` formulas so they can emit either
+   a `PerfEstimate` struct (today's behaviour) or a symbolic Python function
+   (ThroughputSolver-style). Same math; the debug mode just makes the math
+   inspectable.
+
+2. **Adopt the kernel + arch DSLs for generalisation** (the larger investment,
+   tied to approach (2) "Parameterised kernel templates" above). When we
+   extend beyond GEMM, describe each new kernel pattern as a DSL file. Our
+   existing C++ engine becomes the GPU-level wrapper (occupancy, multi-XCD
+   L2, TCP cap); the DSL handles per-kernel critical-path enumeration.
+
+3. **Borrow `Coexecution` ratios opportunistically** (small change, modest gain).
+   Add an explicit co-exec table to `HardwareInfo` to clean up the MFMA-vs-vector
+   overlap modelling that today is buried in roofline math.
+
+We should not adopt the dependency-DAG simulator wholesale. Our closed-form
+corrections already capture most of what the DAG simulator would express, and
+the rewrite cost would exceed the marginal accuracy gain.
+
+### Open questions
+
+- Where does the boundary live between ThroughputSolver's per-workgroup model
+  and our GPU-scale layer? Does the DSL output need to expose registers and
+  LDS occupancy hints, or can we infer those from the DAG?
+- Is the parameter algebra (Div / Sub / Min / Max / Sum / Prod) expressive
+  enough to encode wave-quantization corrections, or do we need to extend it?
+- Can ThroughputSolver itself be extended to model multi-CU effects, or does
+  it inherently assume single-WG? If the former, the integration is much
+  cheaper (just port it).
+
 ---
 
 ## Multiple Triton Kernels and Kernel Fusion
