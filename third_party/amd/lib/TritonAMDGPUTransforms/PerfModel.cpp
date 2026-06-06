@@ -1134,13 +1134,27 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
           : 1.0;
   est.pipelineOverlap = std::max(0.0, pipelineOverlapGluon);
 
-  // Effective tile cycles: compute is always paid, plus any unhidden memory
-  // serializes on top. (Fix 2 attempt 2026-06-06 — under investigation.)
-  double hiddenMemCycles = est.memoryCycles * est.pipelineOverlap;
-  double unhiddenMemCycles = std::max(0.0, est.memoryCycles - hiddenMemCycles);
-  est.effectiveTileCycles = est.computeCycles + unhiddenMemCycles;
+  // Effective tile cycles: standard roofline with overlap.
+  //
+  //   effective = max(compute, memory) + (1 - overlap) * min(compute, memory)
+  //
+  // The previous formula `compute + (1 - overlap) * memory` was wrong for
+  // memory-bound tiles: when overlap=1.0 it returned `compute` even though
+  // memory > compute, so the wall-clock floor (memory) was lost. This
+  // structurally undervalued large tiles (BM=BN=256) that flip
+  // memory-bound→compute-bound vs smaller siblings with the same total work
+  // — at shape 32768×2880×2880, 256×256/BK=64 has compute=184K cyc,
+  // mem=153K cyc, while 128×128/BK=64 has compute=46K cyc, mem=75K cyc.
+  // The old formula reported 128×128 as faster (effective=compute when
+  // overlap=1) when in reality the 128×128 tile's memory > its compute so
+  // its wall-clock floor is 75K not 46K, and 256×256 wins by 1.56× across
+  // 6 vs 23 waves. (Fix 4, 2026-06-06.)
+  const double maxCycles = std::max(est.computeCycles, est.memoryCycles);
+  const double minCycles = std::min(est.computeCycles, est.memoryCycles);
+  const double unhiddenSerial = (1.0 - est.pipelineOverlap) * minCycles;
+  est.effectiveTileCycles = maxCycles + unhiddenSerial;
 
-  est.isComputeBound = (unhiddenMemCycles <= est.computeCycles * 0.05);
+  est.isComputeBound = (est.computeCycles >= est.memoryCycles);
 
   // ── Step 5: Predicted throughput ──────────────────────────────────────────
   //
