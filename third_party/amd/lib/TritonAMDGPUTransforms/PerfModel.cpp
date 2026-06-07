@@ -486,6 +486,10 @@ static int deriveKWidth(const GemmProblem &prob, const TritonGemmConfig &cfg,
   return kBase * std::max(1, cfg.kPack);
 }
 
+// Forward decl: defined below in section 4b.
+static std::pair<int, int> planWarps(int blockM, int blockN, int numWarps,
+                                      int mDim, int nDim);
+
 int estimateVgpr(const GemmProblem &prob, const TritonGemmConfig &cfg,
                  const HardwareInfo &hw) {
   // Each VGPR holds 4 bytes (32-bit register).
@@ -508,12 +512,50 @@ int estimateVgpr(const GemmProblem &prob, const TritonGemmConfig &cfg,
   const int kWidth = deriveKWidth(prob, cfg, hw);
   const int aBytes = (prob.aBits + 7) / 8;
   const int bBytes = (prob.bBits + 7) / 8;
-  const int vgprAFrag =
+  const int vgprAFragBase =
       (cfg.blockM * kWidth * aBytes + ws * bytesPerVgpr - 1) /
       (ws * bytesPerVgpr);
-  const int vgprBFrag =
+  const int vgprBFragBase =
       (cfg.blockN * kWidth * bBytes + ws * bytesPerVgpr - 1) /
       (ws * bytesPerVgpr);
+
+  // Multiple A/B fragments are live simultaneously due to:
+  //   (1) software pipeline depth (numBuffers stages → that many loaded operands)
+  //   (2) K-loop unroll factor (Triton unrolls to fill issue slots when per-iter
+  //       work is small — e.g. sub-mfma-tile per-warp configs, low numKIter)
+  // The unroll factor scales inversely with effective per-iter MFMA work, where
+  // effective work = mfmaPerIterPerWarp × mfmaUtil (sub-mfma-tile MFMAs count
+  // less because each one produces fewer useful output lanes). Target body
+  // size = 8 useful MFMAs per iteration — empirical calibration against AMDGCN
+  // dumps. (Fix 6, 2026-06-07.)
+  int liveFragsMultiplier = estimateNumBuffers(cfg);
+  {
+    auto info = getMfmaInstrInfo(hw.arch, cfg.mfmaNonKDim > 0 ? cfg.mfmaNonKDim : 16,
+                                  cfg.mfmaNonKDim > 0 ? cfg.mfmaNonKDim : 16,
+                                  prob.aKind, prob.cKind);
+    if (info) {
+      auto ceildiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+      int64_t mfmaPerKBlock =
+          ceildiv(cfg.blockM, info->mDim) * ceildiv(cfg.blockN, info->nDim) *
+          ceildiv(cfg.blockK, info->kDim);
+      double mfmaPerIterPerWarp =
+          static_cast<double>(mfmaPerKBlock) / std::max(1, numWarps);
+      auto [wpcM, wpcN] = planWarps(cfg.blockM, cfg.blockN, numWarps,
+                                      info->mDim, info->nDim);
+      double perWarpM = static_cast<double>(cfg.blockM) / std::max(1, wpcM);
+      double perWarpN = static_cast<double>(cfg.blockN) / std::max(1, wpcN);
+      double mfmaUtilM = std::min(1.0, perWarpM / std::max(1, info->mDim));
+      double mfmaUtilN = std::min(1.0, perWarpN / std::max(1, info->nDim));
+      double mfmaUtil = std::max(0.0625, mfmaUtilM * mfmaUtilN);
+      double effectiveWork = std::max(0.125, mfmaPerIterPerWarp * mfmaUtil);
+      constexpr double targetBodyWork = 8.0;
+      int unrollFactor = std::clamp(
+          static_cast<int>(std::ceil(targetBodyWork / effectiveWork)), 1, 8);
+      liveFragsMultiplier *= unrollFactor;
+    }
+  }
+  const int vgprAFrag = vgprAFragBase * liveFragsMultiplier;
+  const int vgprBFrag = vgprBFragBase * liveFragsMultiplier;
 
   // Miscellaneous overhead: base pointers, loop induction variables, predicates
   // and a small stack frame.  28 is an empirical constant calibrated against
@@ -890,6 +932,42 @@ int selectGroupSizeM(const GemmProblem &prob, const TritonGemmConfig &cfg,
 }
 
 //===----------------------------------------------------------------------===//
+// 4b. Triton's warpsPerCTA layout — mirrors AccelerateAMDMatmul.cpp:planWarps.
+//
+// Triton's AMD backend distributes numWarps across (M, N) of the output tile.
+// The algorithm doubles ret[0] (M-direction) or ret[1] (N-direction)
+// alternately based on which dimension has more "room left" relative to mfma
+// instruction shape. If the resulting N-direction allocation overshoots the
+// tile (ret[1]*nDim > N), it transposes to put the larger count on M.
+//
+// We replicate the algorithm here so estimatePerf can predict the per-warp
+// (M, N) sub-tile and detect sub-mfma-tile codegen (where per-warp M or N is
+// below the MFMA instruction's mDim/nDim, forcing wasted-lane mfma issuance).
+//
+// Returns {warpsPerCtaM, warpsPerCtaN}.
+static std::pair<int, int>
+planWarps(int blockM, int blockN, int numWarps, int mDim, int nDim) {
+  if (numWarps <= 0 || mDim <= 0 || nDim <= 0 || blockM <= 0 || blockN <= 0)
+    return {1, std::max(1, numWarps)};
+  int r0 = 1, r1 = 1;
+  while (r0 * r1 < numWarps) {
+    int leftM = (blockM / (mDim * 2)) / r0;
+    int leftN = (blockN / nDim) / r1;
+    if (leftM >= leftN) {
+      if (r0 < blockM / mDim)
+        r0 *= 2;
+      else
+        r1 *= 2;
+    } else {
+      r1 *= 2;
+    }
+  }
+  if (r1 * nDim > blockN)
+    return {r1, r0};
+  return {r0, r1};
+}
+
+//===----------------------------------------------------------------------===//
 // 5. Full performance estimate
 //===----------------------------------------------------------------------===//
 
@@ -1016,6 +1094,27 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
     est.computeCycles =
         static_cast<double>(numMfmaPerKBlock) * numKIter
         * info.throughputCycles / activeSimdsPerCTA;
+    // MFMA lane-utilization penalty (Fix 6, 2026-06-07).
+    //
+    // Triton's planWarps (AccelerateAMDMatmul.cpp:95) distributes numWarps
+    // across (M, N). When the resulting per-warp tile in either dimension
+    // is below the MFMA instruction's mDim/nDim, each mfma call has only
+    // (perWarp/mfmaDim) fraction of its output lanes producing useful work.
+    // The kernel must still issue the full-shape mfma; the wasted lanes
+    // are dead compute. Capture this by inflating computeCycles by 1/util.
+    //
+    // Validation at 16x24576x1536: PM-pick BM=16 BN=32 nW=4 lands on
+    // planWarps=[4,1] → per-warp [4, 32] → util = (4/16) × min(1,32/16) = 0.25
+    // → 4× compute penalty → ranking flips toward larger-tile (e.g. BM=32
+    // BN=64 nW=8 → planWarps=[2,4] → per-warp [16,16] → util=1.0, no penalty).
+    auto [wpcM, wpcN] = planWarps(cfg.blockM, cfg.blockN, cfg.numWarps,
+                                    info.mDim, info.nDim);
+    const double perWarpM = static_cast<double>(cfg.blockM) / std::max(1, wpcM);
+    const double perWarpN = static_cast<double>(cfg.blockN) / std::max(1, wpcN);
+    const double mfmaUtilM = std::min(1.0, perWarpM / std::max(1, info.mDim));
+    const double mfmaUtilN = std::min(1.0, perWarpN / std::max(1, info.nDim));
+    const double mfmaUtil = std::max(0.0625, mfmaUtilM * mfmaUtilN); // floor 1/16
+    est.computeCycles /= mfmaUtil;
   } else {
     // Fallback: full GEMM FLOPs for this output tile.
     est.computeCycles =
@@ -1413,6 +1512,13 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw,
   const int waveCounts[] = {1, 2, 4};
   const int maxTile = 256;
   const int minTile = 2 * mfmaDim; // e.g. 32 for mfmaDim=16
+  // Ultra-skinny relaxation: if the problem dimension is below the standard
+  // minTile, allow single-MFMA tiles (bM/bN = mfmaDim) along that axis.
+  // Padding half of every load (M=16 into BM=32) is worse than the small-tile
+  // overhead in this regime. Validated at 16×24576×1536 where exhaustive
+  // tuning shows BM=16/BN=64 wins by 2.4× over the best BM≥32 candidate.
+  const int minTileM = (prob.M < minTile) ? mfmaDim : minTile;
+  const int minTileN = (prob.N < minTile) ? mfmaDim : minTile;
 
   // Gluon tile constraints. Two tile-size regimes are produced:
   //   * "Big" tiles (BM,BN >= 128, multiples of 128): v9_any_tile kernel
@@ -1432,12 +1538,12 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw,
   for (int wtM : waveTiles) {
     for (int wcM : waveCounts) {
       int bM = mfmaDim * wtM * wcM;
-      if (bM < minTile || bM > maxTile)
+      if (bM < minTileM || bM > maxTile)
         continue;
       for (int wtN : waveTiles) {
         for (int wcN : waveCounts) {
           int bN = mfmaDim * wtN * wcN;
-          if (bN < minTile || bN > maxTile)
+          if (bN < minTileN || bN > maxTile)
             continue;
           if (isGluon) {
             // Big-tile regime: BM, BN >= 128 multiples of 128 (v9_any_tile).
