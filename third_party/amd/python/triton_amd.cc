@@ -449,7 +449,13 @@ void init_triton_amd_perf_model(py::module &&m) {
       .def_readonly("pipeline_overlap",    &PerfEstimate::pipelineOverlap)
       .def_readonly("wave_efficiency",     &PerfEstimate::waveEfficiency)
       .def_readonly("lds_exceeded",        &PerfEstimate::ldsExceeded)
-      .def_readonly("likely_spills",       &PerfEstimate::likelySpills);
+      .def_readonly("likely_spills",       &PerfEstimate::likelySpills)
+      .def_readonly("num_buffers",          &PerfEstimate::numBuffers)
+      .def_readonly("waves_per_simd",       &PerfEstimate::wavesPerSimd)
+      .def_readonly("ctas_per_cu",          &PerfEstimate::ctasPerCU)
+      .def_readonly("total_output_tiles",   &PerfEstimate::totalOutputTiles)
+      .def_readonly("num_waves",            &PerfEstimate::numWaves)
+      .def_readonly("effective_tile_cycles",&PerfEstimate::effectiveTileCycles);
 
   // ── Free functions ─────────────────────────────────────────────────────────
   // generate_candidates: returns vector by value; pybind11 converts to list.
