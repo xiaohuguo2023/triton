@@ -1608,7 +1608,12 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw,
     // but nw=4 wins at small shapes where there isn't enough work to keep
     // 8 warps fed (and SIMD-utilization parity with gluon).
     numWarpsVec  = {4, 8};
-    numStagesVec = {2};
+    // Fix 9 (2026-06-09): also emit nS=3 (3-stage async pipeline). Cross-regime
+    // exhaustive tuning at gfx950 shows 4 of 6 memory-bound shapes win with
+    // nS=3 (the extra pipeline stage hides more LDS/global latency). nS=3 has
+    // higher LDS cost — gets filtered by isValidConfig when it exceeds the
+    // ldsPerCU budget, so it's safe to enumerate broadly.
+    numStagesVec = {2, 3};
   } else {
     numWarpsVec  = {4, 8};
     numStagesVec = {1, 2, 3};
