@@ -168,7 +168,10 @@ HardwareInfo HardwareInfo::get(Arch arch) {
     hw.mallSizeBytes = 0;
     hw.numXCDs = 8;              // Origami: get_default_num_xcds(gfx950) = 8
     hw.clockMHz = 2400.0;
-    hw.peakMemBwBytesPerCycle = 3000.0;  // ~7.2 TB/s / 2.4 GHz
+    hw.peakMemBwBytesPerCycle = 3333.0;  // 8 TB/s official HBM3e peak / 2.4 GHz
+                                          // (= 3333 B/cyc; was 3000 = 7.2 TB/s, too conservative.
+                                          //  TA exhaustive at 16x28672x4096 measured 7.18 TB/s sustained
+                                          //  → 90% of 8 TB/s official, confirming the bump.)
     // L2 BW: calibrated on MI355X = 43 TB/s effective = 17900 bytes/cycle.
     // Now safe to enable: formocastL2HitRate gives tile-size-dependent hit
     // rate (BK-aware via WG simulation), so larger tiles correctly get more
