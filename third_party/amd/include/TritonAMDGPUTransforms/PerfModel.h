@@ -78,6 +78,12 @@ struct HardwareInfo {
   /// Peak L2 bandwidth in bytes per clock cycle (device-wide).
   /// Much higher than DRAM; used to compute effective bandwidth with L2 hits.
   double peakL2BwBytesPerCycle = 0.0;
+  /// Peak LDS read bandwidth in bytes per clock cycle per CU.
+  /// Silicon-fixed (e.g. 128 B/cyc/CU on gfx950). Used by Fix 8 to add an
+  /// ldsCycles term to the roofline for LDS-bandwidth-bound shapes (typical
+  /// at extreme M-skinny where sub-mfma-tile codegen inflates ds_read count).
+  /// Set to 0 to disable the LDS-cycles term for archs not yet calibrated.
+  double ldsBwBytesPerCycleCU = 0.0;
   double clockMHz = 0.0;   ///< Typical boost clock in MHz
 
   // ── Derived helpers ───────────────────────────────────────────────────────
@@ -215,8 +221,9 @@ struct PerfEstimate {
   // ── Latency breakdown (cycles, per tile, on one CU) ───────────────────────
   double computeCycles = 0.0;   ///< Cycles in MFMA instructions
   double memoryCycles = 0.0;    ///< Cycles waiting for global memory
+  double ldsCycles = 0.0;       ///< Cycles to read operand fragments from LDS (Fix 8)
   double pipelineOverlap = 0.0; ///< Memory hidden by SW pipelining  [0..1]
-  double effectiveTileCycles = 0.0; ///< max(compute, (1-overlap)*memory)
+  double effectiveTileCycles = 0.0; ///< max(compute, lds, (1-overlap)*memory)
 
   // ── Derived metrics ────────────────────────────────────────────────────────
   double occupancy = 0.0;           ///< Wavefront slot utilisation  [0..1]

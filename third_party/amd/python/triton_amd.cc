@@ -446,6 +446,7 @@ void init_triton_amd_perf_model(py::module &&m) {
       .def_readonly("arithmetic_intensity",&PerfEstimate::arithmeticIntensity)
       .def_readonly("compute_cycles",      &PerfEstimate::computeCycles)
       .def_readonly("memory_cycles",       &PerfEstimate::memoryCycles)
+      .def_readonly("lds_cycles",          &PerfEstimate::ldsCycles)
       .def_readonly("pipeline_overlap",    &PerfEstimate::pipelineOverlap)
       .def_readonly("wave_efficiency",     &PerfEstimate::waveEfficiency)
       .def_readonly("lds_exceeded",        &PerfEstimate::ldsExceeded)

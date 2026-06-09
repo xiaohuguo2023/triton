@@ -177,6 +177,13 @@ HardwareInfo HardwareInfo::get(Arch arch) {
     // rate (BK-aware via WG simulation), so larger tiles correctly get more
     // L2 benefit than the old BK-independent formula allowed.
     hw.peakL2BwBytesPerCycle = 17900.0;
+    // LDS bandwidth (Fix 8, 2026-06-08): 128 B/cyc/CU per AMD GFX-9 Shader
+    // Programming Guide chapter 15 ("MI-350") spec item GFXIPARCH-1071
+    // "LDS read BW Increase" — doubled from MI-300's 64 B/cyc. Fully
+    // usable with 128-bit per-lane LDS loads (Triton emits `ds_read_b128`).
+    // Used by estimatePerf to add an ldsCycles term to the roofline for
+    // LDS-bound shapes at extreme M-skinny.
+    hw.ldsBwBytesPerCycleCU = 128.0;
     break;
 
   // ── RDNA3  gfx1100/1101/1102 ────────────────────────────────────────────
@@ -983,7 +990,8 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // forces a 16×16 mfma where 12 of 16 M-rows are wasted), the kernel still
   // issues full-shape mfmas, so cycles spent on the MFMA unit = baseline/util.
   // est.computeCycles holds the BASELINE (useful) compute time; the inflation
-  // by 1/mfmaUtil is applied only inside the max(c,m) roofline below (Fix 11).
+  // by 1/mfmaUtil is applied only inside the max(c,m,lds) roofline below.
+  // See Fix 11 comment near effective_tile_cycles for why this matters.
   double mfmaUtil = 1.0;
 
   if (hw.arch == Arch::Unknown || hw.numCUs == 0) {
@@ -1105,33 +1113,29 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
     est.computeCycles =
         static_cast<double>(numMfmaPerKBlock) * numKIter
         * info.throughputCycles / activeSimdsPerCTA;
-    // MFMA lane-utilization penalty (Fix 6, 2026-06-07).
+    // MFMA lane-utilization (Fix 6a + Fix 11):
     //
     // Triton's planWarps (AccelerateAMDMatmul.cpp:95) distributes numWarps
     // across (M, N). When the resulting per-warp tile in either dimension
     // is below the MFMA instruction's mDim/nDim, each mfma call has only
     // (perWarp/mfmaDim) fraction of its output lanes producing useful work.
     // The kernel must still issue the full-shape mfma; the wasted lanes
-    // are dead compute. Capture this by inflating computeCycles by 1/util.
+    // are dead compute.
     //
-    // Validation at 16x24576x1536: PM-pick BM=16 BN=32 nW=4 lands on
-    // planWarps=[4,1] → per-warp [4, 32] → util = (4/16) × min(1,32/16) = 0.25
-    // → 4× compute penalty → ranking flips toward larger-tile (e.g. BM=32
-    // BN=64 nW=8 → planWarps=[2,4] → per-warp [16,16] → util=1.0, no penalty).
+    // Fix 11 (2026-06-09): KEEP est.computeCycles as the BASELINE (useful)
+    // compute time. The 1/mfmaUtil inflation is applied later, only inside
+    // the max(c,m,lds) roofline term — NOT in the pipeline_overlap math.
+    // Reason: at memory-bound shapes the inflated compute happened to match
+    // memory, giving overlap=1.0 (model thinks wasted MFMAs perfectly fill
+    // memory latency), which removed the natural unhidden-serial penalty
+    // smaller-compute configs would get. That compressed the differentiation
+    // between nS=2 and nS=3 (and similar) by ~4×.
     auto [wpcM, wpcN] = planWarps(cfg.blockM, cfg.blockN, cfg.numWarps,
                                     info.mDim, info.nDim);
     const double perWarpM = static_cast<double>(cfg.blockM) / std::max(1, wpcM);
     const double perWarpN = static_cast<double>(cfg.blockN) / std::max(1, wpcN);
     const double mfmaUtilM = std::min(1.0, perWarpM / std::max(1, info.mDim));
     const double mfmaUtilN = std::min(1.0, perWarpN / std::max(1, info.nDim));
-    // Fix 11 (2026-06-09): KEEP est.computeCycles as the BASELINE (useful)
-    // compute time. The 1/mfmaUtil inflation is applied later, only inside
-    // the max(c,m) roofline term — NOT in the pipeline_overlap math below.
-    // Reason: at memory-bound shapes the inflated compute happened to match
-    // memory, giving overlap=1.0 (model thinks wasted MFMAs perfectly fill
-    // memory latency), which removed the natural unhidden-serial penalty
-    // smaller-compute configs would get. That compressed the differentiation
-    // between nS=2 and nS=3 (and similar) by ~4×.
     mfmaUtil = std::max(0.0625, mfmaUtilM * mfmaUtilN); // floor 1/16
     // Note: est.computeCycles intentionally LEFT as baseline. See max() below.
   } else {
@@ -1267,19 +1271,65 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // overlap=1) when in reality the 128×128 tile's memory > its compute so
   // its wall-clock floor is 75K not 46K, and 256×256 wins by 1.56× across
   // 6 vs 23 waves. (Fix 4, 2026-06-06.)
+  // ─── Fix 8 (2026-06-08): LDS-bandwidth roofline term ────────────────────
+  //
+  // At extreme M-skinny shapes the sub-mfma-tile codegen (per-warp tile <
+  // 16×16) forces Triton to issue ~1/mfmaUtil more MFMAs to cover the same
+  // output, each loading its A/B fragments from LDS. Per-CTA LDS traffic
+  // therefore scales with mfmasIssued × (operandBytesPerMfmaPerWarp),
+  // which can exceed the LDS unit's hardware throughput (128 B/cyc/CU on
+  // gfx950, per AMD GFX-9 Programming Guide ch.15 MI-350 spec).
+  //
+  // Compute per-tile ldsCycles analytically from planWarps geometry. Use
+  // it as another arg in max(compute, memory, lds) so LDS-bound shapes
+  // are correctly identified. Hardware-fundamental — silicon-fixed LDS
+  // bw doesn't change with compiler version, so this belongs in the model.
+  est.ldsCycles = 0.0;
+  if (hw.ldsBwBytesPerCycleCU > 0.0 && infoOpt) {
+    const MfmaInstrInfo &info = *infoOpt;
+    auto [wpcM, wpcN] = planWarps(cfg.blockM, cfg.blockN, cfg.numWarps,
+                                    info.mDim, info.nDim);
+    const int perWarpM = cfg.blockM / std::max(1, wpcM);
+    const int perWarpN = cfg.blockN / std::max(1, wpcN);
+    // MFMA instances issued per warp per K-step (rounded up to mfma shape).
+    // Note: sub-mfma-tile per-warp tile (e.g. [4,32]) still issues full
+    // 16×16 mfmas — wasted lanes don't reduce the LDS load count.
+    const int64_t mfmasPerWarpPerKStep =
+        ceildiv(static_cast<int64_t>(perWarpM), static_cast<int64_t>(info.mDim)) *
+        ceildiv(static_cast<int64_t>(perWarpN), static_cast<int64_t>(info.nDim));
+    const int64_t kStepsPerKIter = std::max<int64_t>(1, cfg.blockK / info.kDim);
+    const int kWidth = deriveKWidth(prob, cfg, hw);
+    // Per-warp per-MFMA LDS reads:
+    //   A fragment: mDim × kWidth × aBytes (one row of A, kWidth K-elements)
+    //   B fragment: nDim × kWidth × bBytes (one col of B, kWidth K-elements)
+    const double ldsBytesPerMfmaPerWarp =
+        static_cast<double>(info.mDim) * kWidth * aBytes +
+        static_cast<double>(info.nDim) * kWidth * bBytes;
+    // Per CTA per kernel: × numWarps × kSteps × numKIter
+    const double ldsBytesPerCTA =
+        ldsBytesPerMfmaPerWarp * mfmasPerWarpPerKStep *
+        kStepsPerKIter * numKIter * cfg.numWarps;
+    est.ldsCycles = ldsBytesPerCTA / hw.ldsBwBytesPerCycleCU;
+  }
+
   // Fix 11 (2026-06-09): inflate compute by 1/mfmaUtil only here, in the
   // max() roofline (capturing "MFMA unit occupied by waste cycles"). The
-  // baseline est.computeCycles is used in pipeline_overlap above so that
+  // baseline est.computeCycles was used in pipeline_overlap above so that
   // memory-bound shapes don't get falsely credited with "perfect overlap"
   // when wasted MFMA cycles happen to match memory time. This restores
   // the natural unhidden-serial penalty for shallow-pipeline configs.
   const double inflatedComputeCycles = est.computeCycles / mfmaUtil;
-  const double maxCycles = std::max(inflatedComputeCycles, est.memoryCycles);
+  const double maxCycles = std::max({inflatedComputeCycles, est.memoryCycles,
+                                       est.ldsCycles});
+  // For the overlap term, use min(compute, memory) as before — LDS overlaps
+  // with both compute (operand staging is part of the mfma pipeline) and
+  // memory (different HW unit), so it doesn't add unhidden serial latency.
   const double minCycles = std::min(est.computeCycles, est.memoryCycles);
   const double unhiddenSerial = (1.0 - est.pipelineOverlap) * minCycles;
   est.effectiveTileCycles = maxCycles + unhiddenSerial;
 
-  est.isComputeBound = (est.computeCycles >= est.memoryCycles);
+  est.isComputeBound = (est.computeCycles >= est.memoryCycles &&
+                        est.computeCycles >= est.ldsCycles);
 
   // ── Step 5: Predicted throughput ──────────────────────────────────────────
   //
@@ -1304,6 +1354,12 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // tiles (more waves resident) over large tiles (fewer but with the same
   // effective HBM saturation), even when the larger tile actually has much
   // lower per-output HBM traffic.
+  //
+  // Fix 7 attempt (2026-06-08): tried est.occupancy here — broadly inflated
+  // penalty (+25%) for every memory-bound LDS-limited config without flipping
+  // the target shape (16x24576x1536 stayed at 0.83x). Geomean regressed 1.333→1.291.
+  // Reverted; the lever for 16x24576x1536 is elsewhere (per-CTA bandwidth
+  // saturation modeling or candidate-set refinement, not occupancy penalty).
   const double saturationOccupancy =
       4.0 / std::max(hw.maxWavesPerSimd, 1);
   const double effectiveVgprOcc = std::min(vgprOccupancy, saturationOccupancy);
