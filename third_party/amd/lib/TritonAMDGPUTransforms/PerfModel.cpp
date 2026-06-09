@@ -977,6 +977,14 @@ planWarps(int blockM, int blockN, int numWarps, int mDim, int nDim) {
 PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
                           const HardwareInfo &hw) {
   PerfEstimate est;
+  // mfmaUtil = fraction of MFMA output lanes that produce useful work.
+  // The MFMA instruction has a rigid 16×16 (or 32×32) output shape — when
+  // planWarps gives a warp a per-warp sub-tile smaller than that (e.g. [4,32]
+  // forces a 16×16 mfma where 12 of 16 M-rows are wasted), the kernel still
+  // issues full-shape mfmas, so cycles spent on the MFMA unit = baseline/util.
+  // est.computeCycles holds the BASELINE (useful) compute time; the inflation
+  // by 1/mfmaUtil is applied only inside the max(c,m) roofline below (Fix 11).
+  double mfmaUtil = 1.0;
 
   if (hw.arch == Arch::Unknown || hw.numCUs == 0) {
     est.isValid = false;
@@ -1116,8 +1124,16 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
     const double perWarpN = static_cast<double>(cfg.blockN) / std::max(1, wpcN);
     const double mfmaUtilM = std::min(1.0, perWarpM / std::max(1, info.mDim));
     const double mfmaUtilN = std::min(1.0, perWarpN / std::max(1, info.nDim));
-    const double mfmaUtil = std::max(0.0625, mfmaUtilM * mfmaUtilN); // floor 1/16
-    est.computeCycles /= mfmaUtil;
+    // Fix 11 (2026-06-09): KEEP est.computeCycles as the BASELINE (useful)
+    // compute time. The 1/mfmaUtil inflation is applied later, only inside
+    // the max(c,m) roofline term — NOT in the pipeline_overlap math below.
+    // Reason: at memory-bound shapes the inflated compute happened to match
+    // memory, giving overlap=1.0 (model thinks wasted MFMAs perfectly fill
+    // memory latency), which removed the natural unhidden-serial penalty
+    // smaller-compute configs would get. That compressed the differentiation
+    // between nS=2 and nS=3 (and similar) by ~4×.
+    mfmaUtil = std::max(0.0625, mfmaUtilM * mfmaUtilN); // floor 1/16
+    // Note: est.computeCycles intentionally LEFT as baseline. See max() below.
   } else {
     // Fallback: full GEMM FLOPs for this output tile.
     est.computeCycles =
@@ -1251,7 +1267,14 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // overlap=1) when in reality the 128×128 tile's memory > its compute so
   // its wall-clock floor is 75K not 46K, and 256×256 wins by 1.56× across
   // 6 vs 23 waves. (Fix 4, 2026-06-06.)
-  const double maxCycles = std::max(est.computeCycles, est.memoryCycles);
+  // Fix 11 (2026-06-09): inflate compute by 1/mfmaUtil only here, in the
+  // max() roofline (capturing "MFMA unit occupied by waste cycles"). The
+  // baseline est.computeCycles is used in pipeline_overlap above so that
+  // memory-bound shapes don't get falsely credited with "perfect overlap"
+  // when wasted MFMA cycles happen to match memory time. This restores
+  // the natural unhidden-serial penalty for shallow-pipeline configs.
+  const double inflatedComputeCycles = est.computeCycles / mfmaUtil;
+  const double maxCycles = std::max(inflatedComputeCycles, est.memoryCycles);
   const double minCycles = std::min(est.computeCycles, est.memoryCycles);
   const double unhiddenSerial = (1.0 - est.pipelineOverlap) * minCycles;
   est.effectiveTileCycles = maxCycles + unhiddenSerial;
