@@ -1,5 +1,9 @@
 # AMD PerfModel — Skill Reference & Technical Report
 
+> Background concepts (MFMA tile, wavefront/lane/SIMD hierarchy, kBase/kWidth/kPack
+> derivation and how they feed the cost functions): see
+> [`amd-mfma-hardware-primer.md`](amd-mfma-hardware-primer.md).
+
 ## What This Skill Does
 
 The AMD PerfModel is an **analytical GEMM performance model** for AMD GPUs that predicts the best kernel configuration (tile sizes, pipeline stages, etc.) without benchmarking. It follows Origami's approach: select configs by predicted TFLOPS from a hardware-calibrated roofline model.
@@ -34,7 +38,7 @@ totalOutputTiles = ceil(M/BM) × ceil(N/BN)
 Small-M regime:   M ≤ 4×mfmaDim  OR  totalOutputTiles < numCUs × 4
                   → BK candidates: {kDim, 2×, 4×, 8×, 16×} = {32,64,128,256,512}
                   → numWarps = 8 (CDNA4 only, enables pingpong)
-                  → numStages = 2 (CDNA4 only, empirically optimal)
+                  → numStages ∈ {2, 3} (CDNA4; nS=3 added in Fix 9, 2026-06-09)
                   → Example: M≤64 on gfx950 (256 CUs, mfmaDim=16)
 
 Normal regime:    totalOutputTiles ≥ numCUs × 4
@@ -107,7 +111,15 @@ Layer 3: Roofline + wave quantisation (estimatePerf)
 
 **Aspect ratio tiebreak**: When configs predict equal TFLOPS, prefer the tile whose `log(BN/BM)` is closest to `log(N/M)`. For N>>M shapes (N=5120, M=4096), prefers BM=128×BN=256 over BM=256×BN=128. This matches Origami's WGM intuition for L2 spatial reuse.
 
-**numStages fixed to 2 on CDNA4**: Autotune consistently picks nS=2 across all problem sizes on gfx950. nS=3 slightly overflows LDS for large tiles (256×256×64: 204KB > 160KB limit), and our pipeline overlap formula over-rewards extra stages. Generating only nS=2 for CDNA4 reduces search space without losing good configs.
+**numStages on CDNA4 — UPDATED 2026-06-09 (Fix 9): now {2, 3}**: Originally
+fixed to nS=2 only (autotune mostly picked it; nS=3 overflows LDS for large
+tiles e.g. 256×256×64 and the old overlap formula over-rewarded extra stages).
+Fix 11 corrected the overlap formula (compute used at baseline, not inflated),
+so the over-reward is gone. Cross-regime exhaustive tuning at gfx950 then
+showed 4 of 6 memory-bound shapes win with nS=3 (extra stage hides more
+LDS/global latency). CDNA4 now enumerates `numStagesVec = {2, 3}`; nS=3
+configs that exceed the ldsPerCU budget are dropped by `isValidConfig`, so
+broad enumeration is safe.
 
 ---
 
@@ -211,7 +223,7 @@ int  gsm        = selectGroupSizeM(prob, ranked[0], hw); // GROUP_SIZE_M
 | blockM, blockN | Tile dimensions (power of 2) | ≥ 2×mfmaDim = 32 |
 | blockK | K-block size (power of 2) | ≤ 4×kDim=128 (normal) or 16×kDim=512 (small-M) |
 | numWarps | Wavefronts per CTA | 8 only (enables pingpong) |
-| numStages | Pipeline stages | 2 only (LDS constraint + empirical) |
+| numStages | Pipeline stages | {2, 3} (nS=3 added Fix 9; LDS-overflow cases dropped by isValidConfig) |
 | mfmaNonKDim | MFMA instruction dim | 16 (throughput-based, matches Origami) |
 | groupSizeM | Tile scheduling WGM | Origami's predict_workgroup_mapping |
 
