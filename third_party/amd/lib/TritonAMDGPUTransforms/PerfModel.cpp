@@ -76,7 +76,12 @@ double HardwareInfo::peakMfmaFlopsPerCycleCU() const {
   double throughputCycles = 64.0; // default (CDNA1/2/3)
   switch (arch) {
   case Arch::CDNA4:
-    throughputCycles = 64.0; // same throughput, but wider VGPR file
+    // gfx950 matrix engine is ~4× the per-cycle throughput of CDNA2's 32×32×8
+    // reference: 16384/16 × 4 SIMD = 4096 FLOP/cyc/CU → 2.5 PF dense fp16 on
+    // MI355X (256 CU, 2.4 GHz), matching the published dense peak.
+    // NOTE: this is only the FALLBACK (used when getMfmaInstrInfo() is null);
+    // the common path uses the per-instruction table throughputCycles.
+    throughputCycles = 16.0;
     break;
   case Arch::RDNA3:
   case Arch::RDNA4:
@@ -331,15 +336,21 @@ static constexpr ThroughputEntry kMfmaThroughputTable[] = {
 
   // ── CDNA4  (gfx950) ───────────────────────────────────────────────────────
   // gfx950 introduces wider MFMA variants (mfma_f32_32x32x16_f16,
-  // mfma_f32_16x16x32_f16) with double the kDim vs CDNA3. Same latency in
-  // cycles but processes 2× more K elements per instruction, halving the
-  // number of MFMA ops per tile. Source: MfmaGroup.cpp TRITON_MFMA_v4_2case.
-  {Arch::CDNA4, 32, 32, 16, 64, ElemKind::FP16,  ElemKind::FP32},
-  {Arch::CDNA4, 16, 16, 32, 32, ElemKind::FP16,  ElemKind::FP32},
-  {Arch::CDNA4, 32, 32, 16, 64, ElemKind::BF16,  ElemKind::FP32},
-  {Arch::CDNA4, 16, 16, 32, 32, ElemKind::BF16,  ElemKind::FP32},
-  {Arch::CDNA4, 32, 32, 16, 64, ElemKind::FP8,   ElemKind::FP32},
-  {Arch::CDNA4, 16, 16, 32, 32, ElemKind::FP8,   ElemKind::FP32},
+  // mfma_f32_16x16x32_f16) with double the kDim vs CDNA3, AND ~2× the per-cycle
+  // matrix throughput. Calibrated to the published MI355X dense fp16 peak of
+  // 2.5 PFLOPS: 16×16×32 @ 16 cyc → 16384/16 × 4 SIMD = 4096 FLOP/cyc/CU →
+  // 4096 × 256 CU × 2.4 GHz = 2.5 PF. (Was 32/64 cyc = 1.26 PF, 2× too low —
+  // the old "same latency as CDNA3" assumption undercounted the CDNA4 engine.)
+  {Arch::CDNA4, 32, 32, 16, 32, ElemKind::FP16,  ElemKind::FP32},
+  {Arch::CDNA4, 16, 16, 32, 16, ElemKind::FP16,  ElemKind::FP32},
+  {Arch::CDNA4, 32, 32, 16, 32, ElemKind::BF16,  ElemKind::FP32},
+  {Arch::CDNA4, 16, 16, 32, 16, ElemKind::BF16,  ElemKind::FP32},
+  // FP8 dense = 5 PF on MI355X (2× fp16): 16×16×32 @ 8 cyc → 8192 FLOP/cyc/CU.
+  // (Was 32/64 = matched fp16 — wrong; fp8 must be faster than fp16.)
+  // NOT sweep-validated for the fp8 kernel path (see #77/#81); the 2× ratio is
+  // hardware-certain but fp8 config ranking should be re-checked when validated.
+  {Arch::CDNA4, 32, 32, 16, 16, ElemKind::FP8,   ElemKind::FP32},
+  {Arch::CDNA4, 16, 16, 32,  8, ElemKind::FP8,   ElemKind::FP32},
   {Arch::CDNA4, 32, 32, 32, 64, ElemKind::FP6,   ElemKind::FP32},
   {Arch::CDNA4, 16, 16, 64, 32, ElemKind::FP6,   ElemKind::FP32},
   {Arch::CDNA4, 32, 32, 64, 64, ElemKind::FP4,   ElemKind::FP32},
@@ -1348,7 +1359,7 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   //
   // Saturation point: occupancy only matters until you have enough resident
   // waves to keep HBM busy through the issue queue. Empirically ~4 waves per
-  // SIMD is sufficient (~0.5 of maxWavesPerSimd=8 on gfx950); past that,
+  // SIMD is sufficient (= 0.4 of maxWavesPerSimd=10 on gfx950); past that,
   // additional waves don't reduce HBM time. Without this cap, the penalty
   // continuously rewards higher occupancy and structurally favours small
   // tiles (more waves resident) over large tiles (fewer but with the same
