@@ -1,5 +1,5 @@
 #include "TritonAMDGPUToLLVM/Passes.h"
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
+#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -451,9 +451,9 @@ struct Utils {
   }
 
   static bool isGFX12Plus(StringRef Arch) {
-    auto family = mlir::triton::AMD::deduceISAFamily(Arch);
-    return family == mlir::triton::AMD::ISAFamily::RDNA4 ||
-           family == mlir::triton::AMD::ISAFamily::GFX1250;
+    auto family = mlir::triton::amdgpu::TargetFeatures(Arch).getISAFamily();
+    return family == mlir::triton::amdgpu::ISAFamily::RDNA4 ||
+           family == mlir::triton::amdgpu::ISAFamily::GFX1250;
   }
 
   static void insertSWaitCntBefore(Instruction *IP, int cnt, StringRef Arch) {
