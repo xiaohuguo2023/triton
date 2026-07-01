@@ -424,6 +424,7 @@ void init_triton_amd_perf_model(py::module &&m) {
       .def_readwrite("bypass_lds",     &TritonGemmConfig::bypassLds)
       .def_readwrite("use_async_copy", &TritonGemmConfig::useAsyncCopy)
       .def_readwrite("k_pack",         &TritonGemmConfig::kPack)
+      .def_readwrite("waves_per_eu",   &TritonGemmConfig::wavesPerEu)
       .def_readwrite("group_size_m",   &TritonGemmConfig::groupSizeM)
       .def("__repr__", [](const TritonGemmConfig &c) {
         return "TritonGemmConfig(block_m=" + std::to_string(c.blockM) +
@@ -441,6 +442,7 @@ void init_triton_amd_perf_model(py::module &&m) {
       .def_readonly("is_valid",            &PerfEstimate::isValid)
       .def_readonly("is_compute_bound",    &PerfEstimate::isComputeBound)
       .def_readonly("vgpr_count",          &PerfEstimate::vgprCount)
+      .def_readonly("waves_per_eu",        &PerfEstimate::wavesPerSimd)
       .def_readonly("lds_bytes",           &PerfEstimate::ldsBytes)
       .def_readonly("occupancy",           &PerfEstimate::occupancy)
       .def_readonly("arithmetic_intensity",&PerfEstimate::arithmeticIntensity)

@@ -160,8 +160,16 @@ def config_to_kernel_kwargs(cfg) -> dict:
       matmul_kernel[grid](..., **config_to_kernel_kwargs(cfg))
 
     group_size_m is set by selectGroupSizeM() using Origami's WGM prediction.
+
+    waves_per_eu defaults to 0 ("let the compiler decide occupancy"). The
+    compiler allocates registers from each tile's real demand, so it does not
+    cap a big register-heavy tile the way an explicit hint does — which is what
+    caused the 256x256 spill (aiter forced waves_per_eu=4 → 128-VGPR cap → 139
+    spills). Emitting 0 here overrides any forced default and lets the compiler
+    give each tile the registers it needs. A nonzero hint is emitted only if the
+    model explicitly set one (cfg.waves_per_eu > 0), which it currently doesn't.
     """
-    return {
+    kwargs = {
         "BLOCK_SIZE_M":         cfg.block_m,
         "BLOCK_SIZE_N":         cfg.block_n,
         "BLOCK_SIZE_K":         cfg.block_k,
@@ -169,7 +177,9 @@ def config_to_kernel_kwargs(cfg) -> dict:
         "GROUP_SIZE_M":         cfg.group_size_m,
         "num_warps":            cfg.num_warps,
         "num_stages":           cfg.num_stages,
+        "waves_per_eu":         getattr(cfg, "waves_per_eu", 0),  # 0 = compiler decides
     }
+    return kwargs
 
 
 # ---------------------------------------------------------------------------
