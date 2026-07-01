@@ -164,8 +164,11 @@ HardwareInfo HardwareInfo::get(Arch arch) {
     hw.numSimdPerCU = 4;
     hw.waveSize = 64;
     hw.vgprPerSimd = 512;        // Doubled VGPR file vs CDNA3
-    hw.vgprAllocGranule = 4;
-    hw.maxWavesPerSimd = 10;
+    hw.vgprAllocGranule = 8;     // doubled-file occupancy granularity (matches
+                                 // occ.sh step table & Tensile doubleVgpr align)
+    hw.maxWavesPerSimd = 8;      // Real CDNA4 ceiling: 8 waves/SIMD (compiler
+                                 // reports "final occupancy 8"; matches occ.sh
+                                 // step table cap). Was 10 — over-counted occ.
     hw.ldsPerCU = 163840;        // 160 KB (from TargetInfo.cpp)
     // Origami uses NUM_XCD=8 for gfx950 (same as gfx942 MI300X).
     // L2 capacity per XCD: device L2 / 8 XCDs.
@@ -1019,9 +1022,23 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // LDS feasibility check.
   est.ldsExceeded = (est.ldsBytes > hw.ldsPerCU);
 
-  // VGPR-limited waves per SIMD.
-  est.wavesPerSimd = std::min(hw.maxWavesPerSimd,
-                              hw.vgprPerSimd / std::max(1, est.vgprCount));
+  // VGPR-limited waves per SIMD, using the hardware VGPR *allocation
+  // granularity* — registers are allocated in fixed blocks, so a wave needing
+  // `vgprCount` registers actually reserves ceil(vgprCount/granule)*granule.
+  // This is the exact CDNA step table (matches Tensile getVgprOccupancy and
+  // gfx9-gluon-tutorials/scripts/occ.sh): e.g. vgpr 169 → 2 waves, not 3.
+  // NOTE: this is the PER-WAVE VGPR limit and is intentionally num_warps-
+  // independent. num_warps enters occupancy only through the LDS term below
+  // (LDS is per-workgroup). Do NOT fold a num_warps multiplier in here — that
+  // is Tensile's *workgroup*-occupancy unit, not waves/SIMD, and would
+  // double-count num_warps for waves_per_eu.
+  // Use the per-arch hw.vgprAllocGranule (8 on CDNA4/RDNA4/gfx1250) so this is
+  // correct on every target, not just gfx950.
+  const int granule = std::max(1, hw.vgprAllocGranule);
+  const int vgprAligned =
+      ((std::max(1, est.vgprCount) + granule - 1) / granule) * granule;
+  est.wavesPerSimd =
+      std::min(hw.maxWavesPerSimd, hw.vgprPerSimd / std::max(1, vgprAligned));
   // Heuristic spill threshold: if < 1 wave fits, we hard-spill.
   // Light spill threshold scales with the VGPR file size: 75% of vgprPerSimd.
   // On CDNA3 (256 VGPRs) this is ~192; on CDNA4 (512 VGPRs) this is ~384.
@@ -1253,10 +1270,19 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   const double computePerIter = (numKIter > 0.0) ? est.computeCycles / numKIter : est.computeCycles;
   const double memPerIter     = (numKIter > 0.0) ? est.memoryCycles / numKIter  : est.memoryCycles;
 
-  // iter_latency = max(hbm_latency/depth, compute_per_iter)
-  const double iterLatency = std::max(
+  // iter_latency = max(hbm_latency/depth, compute_per_iter, mem_bandwidth_per_iter)
+  //
+  // The bandwidth term (memPerIter) is a HARD floor: pipelining/prefetch hides
+  // memory *latency* (the HBM round-trip), but it cannot hide *bandwidth* — if a
+  // K-block needs more bytes than the CU can move while computing, the iteration
+  // is bandwidth-bound regardless of pipeline depth. Omitting memPerIter let
+  // low-arithmetic-intensity tiles (e.g. 64x64x128, AI=32) report a high overlap
+  // and be misclassified as compute-bound, predicting near-peak TFLOPS for tiles
+  // that are actually memory-bound (and ~2-4x slower in practice).
+  const double iterLatency = std::max({
       (effectivePipelineDepth > 0.0) ? hbmLatencyCycles / effectivePipelineDepth : hbmLatencyCycles,
-      computePerIter);
+      computePerIter,
+      memPerIter});
 
   // overlap = fraction of memory latency hidden by the pipeline.
   // When iterLatency == computePerIter: all memory hidden → overlap=1.
@@ -1365,27 +1391,61 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // tiles (more waves resident) over large tiles (fewer but with the same
   // effective HBM saturation), even when the larger tile actually has much
   // lower per-output HBM traffic.
+  // ── Origami-style tile-latency assembly ───────────────────────────────────
+  // Ported from rocm-libraries/shared/origami (gemm.cpp compute_tile_latency).
+  // Per-tile latency = per-K-iteration steady state (roofline) × num_iter, plus
+  // FIXED per-tile costs (prologue pipeline-fill + epilogue drain/store) whose
+  // exposure is reduced by occupancy (more resident waves overlap them), plus a
+  // per-iteration loop overhead. Total = per-tile latency × wave timesteps.
   //
-  // Fix 7 attempt (2026-06-08): tried est.occupancy here — broadly inflated
-  // penalty (+25%) for every memory-bound LDS-limited config without flipping
-  // the target shape (16x24576x1536 stayed at 0.83x). Geomean regressed 1.333→1.291.
-  // Reverted; the lever for 16x24576x1536 is elsewhere (per-CTA bandwidth
-  // saturation modeling or candidate-set refinement, not occupancy penalty).
-  const double saturationOccupancy =
-      4.0 / std::max(hw.maxWavesPerSimd, 1);
-  const double effectiveVgprOcc = std::min(vgprOccupancy, saturationOccupancy);
-  double occupancyPenalty =
-      est.isComputeBound ? 1.0
-                         : (1.0 / std::max(effectiveVgprOcc, 0.25));
+  // The crucial idea vs a blanket occupancy penalty: occupancy decays only the
+  // FIXED costs (prologue/epilogue), not steady-state throughput. A low-
+  // occupancy tile pays full fill/drain; a high-occupancy tile amortises it.
+  // This is what distinguishes the SAME wide tile being good (lm_head, many
+  // waves) vs bad (attn_O, few waves).
 
-  // Fix 1 final (2026-06-06): use est.numWaves directly (ceildiv of totalTiles
-  // by numCUs). This is the correct wall-clock count of wave passes — the
-  // partial last wave still takes full computeCycles even with some CUs idle.
-  // Original code divided by waveEfficiency (double-penalty for partial wave);
-  // earlier attempt used `max(1.0, ratio)` (correct for under-fill but lost the
-  // partial-wave wall-clock cost in the 1<ratio<2 regime). ceildiv handles
-  // both correctly: under-fill → 1 wave's wall-clock, well-fed → ceil count.
-  double totalCycles = est.effectiveTileCycles * est.numWaves * occupancyPenalty;
+  // Work utilization across M, N AND K (useful volume / launched volume): the
+  // tile-fill penalty, charged on steady state + prologue.
+  const double launchedM = ceildiv(prob.M, cfg.blockM) * (double)cfg.blockM;
+  const double launchedN = ceildiv(prob.N, cfg.blockN) * (double)cfg.blockN;
+  const double launchedK = ceildiv(prob.K, cfg.blockK) * (double)cfg.blockK;
+  const double utilization =
+      static_cast<double>(prob.M) * prob.N * prob.K /
+      std::max(1.0, launchedM * launchedN * launchedK);
+  const double tilePenalty = 1.0 / std::max(1e-9, utilization);
+
+  // Occupancy as a resident-wave count (Origami real_occupancy), decaying the
+  // fixed costs: occupancy_factor = OCCUPANCY_DECAY_BASE ^ waves.
+  constexpr double kOccupancyDecayBase = 0.95;
+  const double occWaves = std::max(1.0, est.occupancy * hw.maxWavesPerSimd);
+  const double occFactor = std::pow(kOccupancyDecayBase, occWaves);
+
+  // Per-K-iteration steady state (roofline: compute overlaps memory).
+  const double Lsingle =
+      std::max(computePerIter, memPerIter) * tilePenalty;
+
+  // Prologue: fill the pipeline with one K-block of A+B (= memPerIter).
+  const double Lprologue = memPerIter * tilePenalty * occFactor;
+
+  // Epilogue: drain (one K-block compute) + write the output tile to DRAM.
+  const double outWriteCycles =
+      (double)cfg.blockM * cfg.blockN * cBytes / std::max(1e-9, dramBwPerCU);
+  const double Lepilogue = (computePerIter + outWriteCycles) * occFactor;
+
+  // Per-iteration loop overhead (barrier + pointer math + branch), Origami's
+  // WEIGHT_LOOP_OVERHEAD. Scaled to this model's cycle units.
+  constexpr double kLoopOverheadCycles = 500.0;
+
+  const double numIter = std::max(1.0, numKIter - 1.0);
+  constexpr double kWeightPrologue = 1.5;
+  constexpr double kWeightEpilogue = 2.0;
+  double Ltile = Lsingle * numIter
+               + kWeightPrologue * Lprologue
+               + kWeightEpilogue * Lepilogue
+               + kLoopOverheadCycles * numIter;
+
+  // Total = per-tile latency × number of sequential wave timesteps.
+  double totalCycles = Ltile * static_cast<double>(est.numWaves);
 
   double totalFlops = 2.0 * prob.M * prob.N * prob.K * prob.batchSize;
 
@@ -1470,18 +1530,10 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
     scored.push_back({i, estimatePerf(prob, cfg, hw)});
   }
 
-  // Comparator: higher TFLOPS first; tie-break sequence:
-  //  1. arithmetic intensity (larger tile → better cache reuse)
-  //  2. blockK (larger → fewer K-loop iterations, better pipeline fill)
-  //  3. numWarps (larger → enables pingpong scheduling on CDNA3/4)
-  //  4. tile aspect ratio (BN/BM closest to N/M for asymmetric shapes)
-  //  5. blockM (Origami convention, final tie-break)
-  //
-  // Tiebreak 4 rationale: for asymmetric problems where N ≠ M, the tile
-  // orientation that matches the problem aspect ratio (BN/BM ≈ N/M) provides
-  // better L2 spatial reuse. Example: M=4096, N=5120 (N/M=1.25) — the tuned
-  // config uses BM=128×BN=256 (ratio=2.0, closer to 1.25 in log-space) while
-  // the symmetric blockM tiebreak incorrectly picks BM=256×BN=128 (ratio=0.5).
+  // Rank by predicted throughput — the cycle-count model does the work. The
+  // tie-breaks below are deterministic and engage only for genuine near-ties;
+  // there are NO shape-specific heuristics. Accuracy must come from the cycle
+  // model (estimatePerf), not from re-ranking.
   const double problemRatioLog =
       (prob.M > 0 && prob.N > 0)
           ? std::log(static_cast<double>(prob.N) / prob.M)
@@ -1498,11 +1550,8 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
       return configs[a.idx].blockK > configs[b.idx].blockK;
     if (configs[a.idx].numWarps != configs[b.idx].numWarps)
       return configs[a.idx].numWarps > configs[b.idx].numWarps;
-    // Prefer fewer stages: simpler pipeline with less LDS/VGPR pressure.
     if (configs[a.idx].numStages != configs[b.idx].numStages)
       return configs[a.idx].numStages < configs[b.idx].numStages;
-    // Prefer tile aspect ratio (BN/BM) closest to problem aspect ratio (N/M).
-    // Only applies when tile shapes differ (to avoid affecting symmetric cases).
     {
       const auto &ca = configs[a.idx];
       const auto &cb = configs[b.idx];
@@ -1515,15 +1564,13 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
                             : 0.0;
         double diffA = std::abs(ratioA - problemRatioLog);
         double diffB = std::abs(ratioB - problemRatioLog);
-        if (std::abs(diffA - diffB) > 0.05) // tolerance: ~5% ratio difference
+        if (std::abs(diffA - diffB) > 0.05)
           return diffA < diffB;
       }
     }
     return configs[a.idx].blockM > configs[b.idx].blockM;
   };
 
-  // Optimization 3: use partial_sort when only top-K results are needed.
-  // O(N log K) vs O(N log N) — ~7× faster for N=924, K=5.
   const size_t k =
       (topK == 0 || topK >= scored.size()) ? scored.size() : topK;
   if (k < scored.size())
@@ -1531,6 +1578,14 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
   else
     std::stable_sort(scored.begin(), scored.end(), cmp);
 
+  // Leave wavesPerEu at its default of 0 (= "compiler decides occupancy").
+  // The compiler allocates registers from each tile's actual demand, so it does
+  // NOT cap a big register-heavy tile at a fixed budget the way an explicit
+  // waves_per_eu hint does. The catastrophic 256x256 spill came precisely from
+  // aiter FORCING waves_per_eu=4 (→ 128-VGPR cap → 139 spills); emitting 0 lets
+  // the compiler give that tile the registers it needs (no spill). An explicit
+  // hint is only worth adding if benchmarking shows the compiler's own choice is
+  // suboptimal for some tile — to be revisited with measurements.
   std::vector<TritonGemmConfig> result;
   result.reserve(k);
   for (size_t i = 0; i < k; ++i)
