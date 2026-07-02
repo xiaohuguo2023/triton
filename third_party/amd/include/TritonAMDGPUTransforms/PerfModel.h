@@ -144,6 +144,14 @@ std::optional<MfmaInstrInfo> getMfmaInstrInfo(Arch arch, int mDim, int nDim,
 //===----------------------------------------------------------------------===//
 
 /// Describes the mathematical GEMM problem being compiled.
+///
+/// GROUPED / MoE CONTRACT: for a grouped (fused-MoE) GEMM the caller MUST set
+/// `M` to the EFFECTIVE TOTAL rows the config processes across all experts
+/// (≈ total_routed_tokens = num_tokens · top_k), NOT the per-tile `block_m`.
+/// The cost model derives the tile count / numWaves from M, and that cross-tile
+/// amortization is what lets larger BLOCK_N win (fewer N-tiles → less repeated A
+/// traffic). Passing block_m as M yields numWaves≈1 and collapses the ranking to
+/// the smallest tile. (block_m is a TritonGemmConfig field, not the problem M.)
 struct GemmProblem {
   int64_t M = 0;
   int64_t N = 0;

@@ -266,6 +266,26 @@ int elemKindBits(ElemKind k) {
   }
 }
 
+// Which MFMA the hardware actually issues for a (possibly mixed-precision) dot,
+// as a throughput-table lookup key:
+//   - When BOTH operands are ≤8-bit (a8w4, a8w8, a4w4, a8wfp4) the scaled
+//     f8f6f4 MFMA is issued; its throughput is set by the NARROWEST operand
+//     (a8w4 → fp4 → the 16×16×128 @10 PF rate, NOT the fp8 activation). Costing
+//     a8w4 at the fp8 rate halves its throughput → everything looks memory-bound
+//     → smallest-BN mis-rank.
+//   - When EITHER operand is ≥16-bit (a16w16, and crucially a16wfp4 where the
+//     fp4 weight is upconverted to fp16) there is no low-precision MFMA; the
+//     standard wide MFMA runs at the WIDER operand's rate. Using the narrowest
+//     here would wrongly cost a16wfp4 at the fp4 rate (4× too fast).
+// Same-type GEMMs (a16w16, a8w8) return the unchanged kind either way.
+static ElemKind mfmaComputeKind(ElemKind a, ElemKind b) {
+  const int ab = elemKindBits(a), bb = elemKindBits(b);
+  const bool bothLowPrec = (ab <= 8) && (bb <= 8); // f8f6f4 scaled-MFMA eligible
+  if (bothLowPrec)
+    return (bb < ab) ? b : a; // narrowest → scaled f8f6f4 class rate
+  return (bb > ab) ? b : a;   // widest → dequant to wide-MFMA rate
+}
+
 ElemKind elemKindFromBits(int bits, bool isFloat, bool isBF) {
   if (!isFloat) {
     if (bits == 8) return ElemKind::I8;
@@ -356,8 +376,13 @@ static constexpr ThroughputEntry kMfmaThroughputTable[] = {
   {Arch::CDNA4, 16, 16, 32,  8, ElemKind::FP8,   ElemKind::FP32},
   {Arch::CDNA4, 32, 32, 32, 64, ElemKind::FP6,   ElemKind::FP32},
   {Arch::CDNA4, 16, 16, 64, 32, ElemKind::FP6,   ElemKind::FP32},
-  {Arch::CDNA4, 32, 32, 64, 64, ElemKind::FP4,   ElemKind::FP32},
-  {Arch::CDNA4, 16, 16,128, 32, ElemKind::FP4,   ElemKind::FP32},
+  // FP4 dense = 10.1 PF on MI355X (2× fp8): 16×16×128 @ 16 cyc →
+  // 16*16*128*2/16 = 4096 FLOP/cyc/SIMD × 4 SIMD = 16384 FLOP/cyc/CU →
+  // × 256 CU × 2.4 GHz = 10.06 PF. (Was @32/64 cyc = 5 PF = same as fp8, which
+  // under-counted fp4's 2× compute density and made a8w4 tiles look memory-bound
+  // → systematic smallest-BN mis-rank vs the sweep-tuned BN256 winners.)
+  {Arch::CDNA4, 32, 32, 64, 32, ElemKind::FP4,   ElemKind::FP32},
+  {Arch::CDNA4, 16, 16,128, 16, ElemKind::FP4,   ElemKind::FP32},
   {Arch::CDNA4, 16, 16,  4, 64, ElemKind::FP64,  ElemKind::FP64},
   {Arch::CDNA4, 32, 32,  8, 64, ElemKind::I8,    ElemKind::I8},
   {Arch::CDNA4, 16, 16, 16, 32, ElemKind::I8,    ElemKind::I8},
@@ -421,7 +446,7 @@ int selectMfmaNonKDim(const GemmProblem &prob, const TritonGemmConfig &cfg,
   double bestThroughput = -1.0;
 
   for (const auto &e : kMfmaThroughputTable) {
-    if (e.arch != hw.arch || e.aKind != prob.aKind || e.cKind != prob.cKind)
+    if (e.arch != hw.arch || e.aKind != mfmaComputeKind(prob.aKind, prob.bKind) || e.cKind != prob.cKind)
       continue;
     // Only consider square MFMA tiles (mDim == nDim).
     if (e.mDim != e.nDim)
@@ -494,7 +519,7 @@ static int deriveKWidth(const GemmProblem &prob, const TritonGemmConfig &cfg,
                        ? cfg.mfmaNonKDim
                        : selectMfmaNonKDim(prob, cfg, hw);
 
-  auto infoOpt = getMfmaInstrInfo(hw.arch, mDim, mDim, prob.aKind, prob.cKind);
+  auto infoOpt = getMfmaInstrInfo(hw.arch, mDim, mDim, mfmaComputeKind(prob.aKind, prob.bKind), prob.cKind);
   if (!infoOpt)
     return 8; // safe fallback for unknown intrinsics
 
@@ -556,7 +581,7 @@ int estimateVgpr(const GemmProblem &prob, const TritonGemmConfig &cfg,
   {
     auto info = getMfmaInstrInfo(hw.arch, cfg.mfmaNonKDim > 0 ? cfg.mfmaNonKDim : 16,
                                   cfg.mfmaNonKDim > 0 ? cfg.mfmaNonKDim : 16,
-                                  prob.aKind, prob.cKind);
+                                  mfmaComputeKind(prob.aKind, prob.bKind), prob.cKind);
     if (info) {
       auto ceildiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
       int64_t mfmaPerKBlock =
@@ -619,8 +644,14 @@ int estimateLdsBytes(const GemmProblem &prob, const TritonGemmConfig &cfg,
     return 0;
 
   const int numBuf = estimateNumBuffers(cfg);
-  const int aBytes = (prob.aBits + 7) / 8;
-  const int bBytes = (prob.bBits + 7) / 8;
+  // Integer bytes gate the bf16-only calibrated async path; FRACTIONAL bytes size
+  // the actual footprint (fp4=0.5 B packed + 1 B/32 mxfp4 weight block scale) so
+  // a8w4 LDS isn't over-counted (which wrongly marked winner configs invalid).
+  const int aBytesInt = (prob.aBits + 7) / 8;
+  const int bBytesInt = (prob.bBits + 7) / 8;
+  const double aBytes = prob.aBits / 8.0;
+  const bool bMxLds = (prob.bKind == ElemKind::FP4 || prob.bKind == ElemKind::FP6);
+  const double bBytes = prob.bBits / 8.0 + (bMxLds ? 1.0 / 32.0 : 0.0);
 
   if (cfg.useAsyncCopy) {
     // ── Calibrated async PaddedSharedEncoding footprint (verified common case).
@@ -639,7 +670,7 @@ int estimateLdsBytes(const GemmProblem &prob, const TritonGemmConfig &cfg,
     // we fall back to the old [[32,4]] formula (unchanged behavior).
     const int mfmaDimLds = cfg.mfmaNonKDim > 0 ? cfg.mfmaNonKDim : 16;
     const int kWidthLds  = deriveKWidth(prob, cfg, hw);
-    if (aBytes == 2 && bBytes == 2 && mfmaDimLds == 16 && kWidthLds == 8) {
+    if (aBytesInt == 2 && bBytesInt == 2 && mfmaDimLds == 16 && kWidthLds == 8) {
       constexpr int64_t vecSize  = 16 / 2;       // elems per 16B vector (bf16)
       constexpr int64_t interval = 64 * vecSize; // warpSize*vecSize = 512
       const int64_t kWidthBytes  = (int64_t)kWidthLds * 2;
@@ -687,9 +718,9 @@ int estimateLdsBytes(const GemmProblem &prob, const TritonGemmConfig &cfg,
   }
 
   // Synchronous copy: conservative 8-element row padding.
-  const int ldsA = numBuf * cfg.blockM * (cfg.blockK + 8) * aBytes;
-  const int ldsB = numBuf * cfg.blockN * (cfg.blockK + 8) * bBytes;
-  return ldsA + ldsB;
+  const double ldsA = numBuf * cfg.blockM * (cfg.blockK + 8) * aBytes;
+  const double ldsB = numBuf * cfg.blockN * (cfg.blockK + 8) * bBytes;
+  return static_cast<int>(ldsA + ldsB);
 }
 
 //===----------------------------------------------------------------------===//
@@ -724,8 +755,8 @@ computeMallTiles(int64_t gridM, int64_t gridN, int64_t activeCUs, int64_t wgm) {
 static std::pair<int64_t, int64_t>
 computeL2Tiles(int64_t gridM, int64_t gridN, int64_t activeCUs,
                int64_t wgm, int64_t numXCDs, int64_t l2SizeBytes,
-               int64_t blockM, int64_t blockK, int aBytes,
-               int64_t blockN, int bBytes) {
+               int64_t blockM, int64_t blockK, double aBytes,
+               int64_t blockN, double bBytes) {
   if (gridM == 0 || gridN == 0 || activeCUs == 0)
     return {1, 1};
   const int64_t cuPerXcd = std::max(activeCUs / std::max(numXCDs, int64_t(1)), int64_t(1));
@@ -1159,7 +1190,7 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   const double numKIter =
       (cfg.blockK > 0) ? static_cast<double>(prob.K) / cfg.blockK : 1.0;
 
-  auto infoOpt = getMfmaInstrInfo(hw.arch, mDim, mDim, prob.aKind, prob.cKind);
+  auto infoOpt = getMfmaInstrInfo(hw.arch, mDim, mDim, mfmaComputeKind(prob.aKind, prob.bKind), prob.cKind);
   if (!infoOpt) {
     infoOpt = getMfmaInstrInfo(hw.arch, 16, 16, ElemKind::FP16, ElemKind::FP32);
   }
@@ -1211,14 +1242,24 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   }
 
   // Memory cycles: total A/B traffic across all K iterations.
-  const int aBytes = (prob.aBits + 7) / 8;
-  const int bBytes = (prob.bBits + 7) / 8;
+  // FRACTIONAL element bytes: fp4 = 0.5 B (packed) — NOT (bits+7)/8 which rounds
+  // 4-bit up to 1 B and doubles the weight traffic, making a8w4 look far more
+  // memory-bound than it is. mxfp4/mxfp6 weights ALSO stream a 1-byte E8M0 block
+  // scale per 32 weight elements; that follows the B (weight) stream, so we fold
+  // it into an effective weight byte: bBytesEff = bits/8 + 1/32. (Activation is
+  // static-scale fp8 for gpt-oss → its scale is a scalar, negligible.)
+  const double aBytesF = prob.aBits / 8.0;
+  const bool bIsMxScaled =
+      (prob.bKind == ElemKind::FP4 || prob.bKind == ElemKind::FP6);
+  constexpr double kMxScaleBytesPerElem = 1.0 / 32.0; // 1B E8M0 per 32 elems
+  const double bBytesF =
+      prob.bBits / 8.0 + (bIsMxScaled ? kMxScaleBytesPerElem : 0.0);
   const int cBytes = (prob.cBits + 7) / 8;
 
-  // Per K-block fetch (one stage worth of A+B).
+  // Per K-block fetch (one stage worth of A+B, incl. weight block scales).
   double tileBytesABperK =
-      static_cast<double>(cfg.blockM * cfg.blockK * aBytes +
-                          cfg.blockN * cfg.blockK * bBytes);
+      static_cast<double>(cfg.blockM) * cfg.blockK * aBytesF +
+      static_cast<double>(cfg.blockN) * cfg.blockK * bBytesF;
   // Total A/B traffic: numKIter fetches of the K-block (exact, not ceil).
   double tileBytesAB = tileBytesABperK * numKIter;
   double tileBytesC  = static_cast<double>(cfg.blockM * cfg.blockN * cBytes);
@@ -1242,8 +1283,10 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
     // ABSOLUTE rate, which was wildly gm-sensitive (gm swung memoryCycles by
     // multiples). Here formocast is used ONLY to LIMIT the WGM bonus.
     const int64_t activeCUs = std::min<int64_t>(gridM * gridN, hw.numCUs);
-    const int aBytesL2 = (prob.aBits + 7) / 8;
-    const int bBytesL2 = (prob.bBits + 7) / 8;
+    // Same fractional-byte + block-scale accounting as the traffic model above,
+    // so L2 capacity/reuse reflects real packed-fp4 working-set sizes.
+    const double aBytesL2 = aBytesF;
+    const double bBytesL2 = bBytesF;
     auto capHit = [&](int64_t w) {
       auto [l2M, l2N] =
           computeL2Tiles(gridM, gridN, activeCUs, w, hw.numXCDs, hw.l2SizeBytes,
@@ -1459,12 +1502,12 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
         ceildiv(static_cast<int64_t>(perWarpN), static_cast<int64_t>(info.nDim));
     const int64_t kStepsPerKIter = std::max<int64_t>(1, cfg.blockK / info.kDim);
     const int kWidth = deriveKWidth(prob, cfg, hw);
-    // Per-warp per-MFMA LDS reads:
-    //   A fragment: mDim × kWidth × aBytes (one row of A, kWidth K-elements)
-    //   B fragment: nDim × kWidth × bBytes (one col of B, kWidth K-elements)
+    // Per-warp per-MFMA LDS reads (packed fractional bytes: fp4=0.5 B + scale).
+    //   A fragment: mDim × kWidth × aBytesF (one row of A, kWidth K-elements)
+    //   B fragment: nDim × kWidth × bBytesF (one col of B, kWidth K-elements)
     const double ldsBytesPerMfmaPerWarp =
-        static_cast<double>(info.mDim) * kWidth * aBytes +
-        static_cast<double>(info.nDim) * kWidth * bBytes;
+        static_cast<double>(info.mDim) * kWidth * aBytesF +
+        static_cast<double>(info.nDim) * kWidth * bBytesF;
     // Per CTA per kernel: × numWarps × kSteps × numKIter
     const double ldsBytesPerCTA =
         ldsBytesPerMfmaPerWarp * mfmasPerWarpPerKStep *
@@ -1502,8 +1545,17 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   const int minTileDim = std::min(cfg.blockM, cfg.blockN);
   const double mfmaEfficiency =
       kPeakMfmaEff * std::min(1.0, static_cast<double>(minTileDim) / 128.0);
-  // Realized compute roofline: theoretical MFMA cycles inflated by both the
+
+  // Realized compute roofline: theoretical MFMA cycles inflated by the
   // lane-utilization waste (1/mfmaUtil) and the realized-efficiency de-rate.
+  // TODO(fp4 residency): a dtype-aware MFMA dependency stall belongs here —
+  // required_waves = fixed_latency / issue_interval (throughputCycles), so fp4's
+  // faster MFMA needs MORE resident waves to hide operand/scale-load latency;
+  // stall = max(1, required_waves / resident_waves). Deferred until a broader
+  // held-out sweep can calibrate it without overfitting 8 shapes. (An occupancy-
+  // only stall was tried and is insufficient: bf16 256x256 and fp4 BN512 both
+  // sit at 1 CTA/CU but have opposite real outcomes — the differentiator is
+  // compute-work-per-wave vs latency, i.e. the issue_interval, not occupancy.)
   const double inflatedComputeCycles =
       est.computeCycles / (mfmaUtil * std::max(mfmaEfficiency, 0.05));
   const double maxCycles = std::max({inflatedComputeCycles, est.memoryCycles,
@@ -1608,7 +1660,7 @@ bool isValidConfig(const GemmProblem &prob, const TritonGemmConfig &cfg,
   int mDim = cfg.mfmaNonKDim > 0 ? cfg.mfmaNonKDim
                                   : selectMfmaNonKDim(prob, cfg, hw);
   auto infoOpt =
-      getMfmaInstrInfo(hw.arch, mDim, mDim, prob.aKind, prob.cKind);
+      getMfmaInstrInfo(hw.arch, mDim, mDim, mfmaComputeKind(prob.aKind, prob.bKind), prob.cKind);
   if (infoOpt && (cfg.blockK % infoOpt->kDim) != 0)
     return false;
 
@@ -1732,7 +1784,8 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw,
   // Look up kDim from the throughput table for this arch+dtype combination.
   int mfmaKDim = 16; // safe default
   if (auto info = getMfmaInstrInfo(hw.arch, mfmaDim, mfmaDim,
-                                   prob.aKind, prob.cKind))
+                                   mfmaComputeKind(prob.aKind, prob.bKind),
+                                   prob.cKind))
     mfmaKDim = info->kDim;
 
   // blockK candidates depend on the problem's utilization regime.
