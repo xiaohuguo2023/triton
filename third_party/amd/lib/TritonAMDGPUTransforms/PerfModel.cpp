@@ -623,9 +623,47 @@ int estimateLdsBytes(const GemmProblem &prob, const TritonGemmConfig &cfg,
   const int bBytes = (prob.bBits + 7) / 8;
 
   if (cfg.useAsyncCopy) {
-    // Async-copy path uses PaddedSharedEncoding — apply TensorAtlas's formula:
-    //   padded = max(_padded32x4(elem), _paddedDim8(elem, dim))
-    // matching Triton's composePaddedLayoutForAsyncCopyCDNA4 intent.
+    // ── Calibrated async PaddedSharedEncoding footprint (verified common case).
+    // The [[32,4]] `ldspadded32x4` mirror below OVER-counts the real
+    // PaddedSharedEncoding by ~9% (it pads 4 elems/32; real bank-conflict
+    // padding is ~1/4 of that), which wrongly marks valid pingpong configs as
+    // LDS-exceeding and excludes the measured true-best (e.g. 256x128x64 ns3 =
+    // 152000 B < 163840 B). Triton's composePaddedLayoutForAsyncCopyCDNA4
+    // (Utility.cpp:202-239) inserts `padding` elems per
+    // paddingInterval = warpSize*vecSize; for the VERIFIED regime
+    // (elemBytes==2, mfmaNonKDim==16, kWidth==8 → ds_read_b128/b64_tr,
+    // padding=16 per 512-elem interval) the allocated size is
+    //   padded(n) = n + (n/interval)*padding - padding/2   (aligned tail)
+    // This reproduces measured hardware LDS EXACTLY (256x256x64 ns2 = 135104 B,
+    // 256x128x64 ns2 = 101312 B, ns3 = 151968 vs 152000 B). Outside this regime
+    // we fall back to the old [[32,4]] formula (unchanged behavior).
+    const int mfmaDimLds = cfg.mfmaNonKDim > 0 ? cfg.mfmaNonKDim : 16;
+    const int kWidthLds  = deriveKWidth(prob, cfg, hw);
+    if (aBytes == 2 && bBytes == 2 && mfmaDimLds == 16 && kWidthLds == 8) {
+      constexpr int64_t vecSize  = 16 / 2;       // elems per 16B vector (bf16)
+      constexpr int64_t interval = 64 * vecSize; // warpSize*vecSize = 512
+      const int64_t kWidthBytes  = (int64_t)kWidthLds * 2;
+      // padding amount per interval (Utility.cpp:233-239, mfmaNonKDim==16):
+      //   A operand is K-contiguous → ds_read_b128 (kWidthBytes==16) → kWidth*2
+      //   B operand is N-contiguous → ds_read_b64_tr (kWidthBytes>=8) → 16
+      auto padAmt = [&](bool kContig) -> int64_t {
+        if (kContig && kWidthBytes == 16) return kWidthLds * 2; // b128, mfma16
+        if (!kContig && kWidthBytes >= 8) return 16;            // b64_tr, mfma16
+        return 8 / 2;                                           // elemsPer8Bytes
+      };
+      auto padded = [&](int64_t n, bool kContig) -> int64_t {
+        const int64_t p = padAmt(kContig);
+        int64_t add = (n / interval) * p;
+        if (n % interval == 0 && add >= p) add -= p / 2; // aligned last interval
+        return n + add;
+      };
+      const int64_t elemA = (int64_t)cfg.blockM * cfg.blockK; // A: K contiguous
+      const int64_t elemB = (int64_t)cfg.blockN * cfg.blockK; // B: N contiguous
+      return static_cast<int>(numBuf * (padded(elemA, true) * aBytes +
+                                        padded(elemB, false) * bBytes));
+    }
+
+    // Fallback (unverified regimes): original [[32,4]] approximation.
     int64_t elemA = (int64_t)cfg.blockM * cfg.blockK;
     int64_t elemB = (int64_t)cfg.blockN * cfg.blockK;
 
@@ -1195,13 +1233,54 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
 
   double l2HitRate = 0.0;
   if (hw.l2SizeBytes > 0 && hw.numCUs > 0 && gridM > 0 && gridN > 0) {
-    // Formocast simulation-based L2 hit rate accounts for WG launch order
-    // and per-XCD cache eviction — captures the tile-size-dependent reuse
-    // gap that the BK-independent estimateL2HitRate misses. Falls back to
-    // the older formula if the simulation hits an edge case.
-    l2HitRate = formocastL2HitRate(prob.M, prob.N, prob.K,
-                                    cfg.blockM, cfg.blockN,
-                                    hw.numCUs, hw.numXCDs, wgm);
+    // Physical story: L2 CAPACITY gives the baseline operand reuse (largely
+    // GROUP_SIZE_M-independent — the hardware L2 caches reused operands whatever
+    // the launch order). WGM can only ADD a small locality bonus; it cannot
+    // remove baseline reuse or multiply throughput. Measured HW confirms:
+    // changing gm moves throughput only ~tens of percent (256x128 gm1->gm8 =
+    // +4%). The old code used the raw formocast (scheduling) hit rate as the
+    // ABSOLUTE rate, which was wildly gm-sensitive (gm swung memoryCycles by
+    // multiples). Here formocast is used ONLY to LIMIT the WGM bonus.
+    const int64_t activeCUs = std::min<int64_t>(gridM * gridN, hw.numCUs);
+    const int aBytesL2 = (prob.aBits + 7) / 8;
+    const int bBytesL2 = (prob.bBits + 7) / 8;
+    auto capHit = [&](int64_t w) {
+      auto [l2M, l2N] =
+          computeL2Tiles(gridM, gridN, activeCUs, w, hw.numXCDs, hw.l2SizeBytes,
+                         cfg.blockM, cfg.blockK, aBytesL2, cfg.blockN, bBytesL2);
+      return estimateL2HitRate(l2M, l2N, cfg.blockM, cfg.blockK, cfg.blockN);
+    };
+    // Capacity baseline at gm-neutral wgm=1, plus a bounded WGM locality bonus.
+    const double hitBase  = capHit(1);
+    const double wgmBonus = std::max(0.0, capHit(wgm) - hitBase);
+    // formocast (scheduling) only limits the bonus — never sets the base.
+    const double rawBase = formocastL2HitRate(prob.M, prob.N, prob.K, cfg.blockM,
+                                              cfg.blockN, hw.numCUs, hw.numXCDs, 1);
+    const double rawWgm  = formocastL2HitRate(prob.M, prob.N, prob.K, cfg.blockM,
+                                              cfg.blockN, hw.numCUs, hw.numXCDs, wgm);
+    const double rawBonus = std::max(0.0, rawWgm - rawBase);
+    constexpr double kMaxWgmHitBonus = 0.15; // WGM adds at most ~15% hit rate
+    const double bonus = std::min({wgmBonus, rawBonus, kMaxWgmHitBonus});
+    l2HitRate = std::min(1.0, hitBase + bonus);
+
+    // ── K-depth cache warmup (Origami gemm.cpp:1198, L2_COLD_FLOOR/L2_DEPTH_SQ).
+    // Principled BLOCK_K cost. The analytical compute/memory roofline is
+    // BK-INVARIANT (compute ∝ BK and k_iters ∝ 1/BK cancel; A/B traffic and
+    // arithmetic intensity likewise), so without this term the model is truly
+    // indifferent to BLOCK_K and the ranking tiebreak arbitrarily prefers the
+    // larger BK — but measured HW consistently prefers SMALLER BK when the
+    // roofline ties (24 residual misses, all directions unanimous). Physics:
+    // shallow K-loops (large BK → few k-iters) get less cold-start cache
+    // warmup, so a larger fraction of A/B traffic misses L2. This multiplies
+    // the L2 hit rate and is bounded below by the cold floor (0.75), so a
+    // genuinely-better large-BK config can still win on the compute/overlap
+    // terms — it only breaks the otherwise-tied memory term toward smaller BK.
+    constexpr double kL2ColdFloor = 0.75; // Origami L2_COLD_FLOOR
+    constexpr double kL2DepthSq   = 4.0;  // Origami L2_DEPTH_SQ
+    const double kIters2 = numKIter * numKIter;
+    const double l2Warmup =
+        kL2ColdFloor + (1.0 - kL2ColdFloor) * kIters2 / (kIters2 + kL2DepthSq);
+    l2HitRate *= l2Warmup;
   }
 
   // Effective bandwidth: DRAM for misses, L2 for hits.
@@ -1222,21 +1301,26 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   }
   est.memoryCycles = memCycles;
 
-  // ── Step 4: TCP-capped pipeline overlap (gluon memory_bandwidth_model.md) ───
+  // ── Step 4: pipeline overlap (gluon memory_bandwidth_model.md) ──────────────
   //
-  // Effective pipeline depth from gluon's E2E model:
+  // Effective pipeline depth and iter latency:
   //
-  //   data_per_request_per_wave = (A_tile + B_tile) / numWarps   [bytes per wave per K-block]
-  //   effective_pipeline_depth  = min(numStages - 1,
-  //                                   TCPsizeBytes / (numActiveWaves × dataPerWave))
-  //   iter_latency = max(hbm_latency / effective_pipeline_depth, compute_latency)
-  //   overlap      = 1 - compute_latency / iter_latency
+  //   data_per_request_per_wave = (A_tile + B_tile) / numWarps   [bytes/wave/K-block]
+  //   effective_pipeline_depth  = async ? (numStages - 1)
+  //                                     : min(numStages - 1, TCPsizeBytes/(waves×data))
+  //   iter_latency = max(hbm_latency / depth, compute_per_iter, effMemPerIter)
+  //   overlap      = 1 - (iter_latency - compute_per_iter) / effMemPerIter
   //
-  // The TCP (L1 cache, 32 KB per CU on GFX9/GFX950) caps how many in-flight
-  // bytes each CU can sustain. Larger data_per_wave (from larger BK) means fewer
-  // in-flight slots → lower effective pipeline depth → less memory latency hiding.
-  // This is why BK=64 outperforms BK=128 at M=1536 despite identical TFLOPS in the
-  // naive roofline: the TCP cap limits BK=128's pipeline depth more severely.
+  // Two distinct pipeline-depth effects:
+  //  1) SYNC copy streams operands through the TCP (L1, 32 KB/CU on GFX9/GFX950),
+  //     which caps in-flight bytes: larger data_per_wave (large BK) → fewer slots
+  //     → less latency hiding (why BK=64 beats BK=128 at M=1536 at equal TFLOPS).
+  //     ASYNC copy stages directly into the numStages LDS buffers (already
+  //     accounted), NOT the TCP, so its depth is LDS-limited to numStages-1.
+  //  2) The bandwidth floor (effMemPerIter) is itself depth-dependent for async:
+  //     via Little's law, deeper staging sustains more outstanding bytes and thus
+  //     higher achieved DRAM BW (capped at peak) — so numStages affects even
+  //     bandwidth-classified tiles (ns3 > ns2). See the effMemPerIter block below.
   //
   // Constants (GFX950 / CDNA4):
   constexpr double tcpSizeBytes = 32768.0; // TCP = 32 KB per CU (GFX9/GFX950)
@@ -1260,8 +1344,19 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   const double tcpDepth = (dataPerWave > 0.0 && numActiveWaves > 0)
                               ? tcpSizeBytes / (numActiveWaves * dataPerWave)
                               : static_cast<double>(cfg.numStages - 1);
+  // Async-copy (direct global→LDS) stages operands in the numStages LDS buffers
+  // we already account for — it does NOT stream through the TCP/L1, so the TCP
+  // cap does not apply and the achievable in-flight depth is LDS-limited to
+  // numStages-1. This is what lets a deeper-staged pingpong config (ns3) hide
+  // more HBM latency than ns2 for the SAME tile: measured 256x128x64 ns3=1058
+  // vs ns2=966 TF. For sync copy, staging goes through L1 and the TCP cap stands.
+  // NOTE: this only lowers the hbm_latency/depth term; the memPerIter bandwidth
+  // floor in the max() below still binds, so ns3 gets NO benefit on tiles that
+  // are already bandwidth-bound (the benefit is capped where it should be).
   const double effectivePipelineDepth =
-      std::min(static_cast<double>(cfg.numStages - 1), tcpDepth);
+      cfg.useAsyncCopy
+          ? static_cast<double>(cfg.numStages - 1)
+          : std::min(static_cast<double>(cfg.numStages - 1), tcpDepth);
 
   // Iter latency from gluon E2E model:
   //   iter_latency = max(hbm_latency / effective_depth, compute_latency_per_iter)
@@ -1270,26 +1365,54 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   const double computePerIter = (numKIter > 0.0) ? est.computeCycles / numKIter : est.computeCycles;
   const double memPerIter     = (numKIter > 0.0) ? est.memoryCycles / numKIter  : est.memoryCycles;
 
+  // ── Little's-law effective memory bandwidth (async path only) ───────────────
+  // The plain memPerIter above assumes DRAM is always serviced at PEAK BW. But
+  // sustained BW = outstanding_bytes / round_trip_latency (Little's law): with
+  // only a shallow async pipeline (ns2 → 1 buffer in flight) a CU cannot keep
+  // enough bytes outstanding to saturate HBM, so it achieves LESS than peak and
+  // the per-iter memory service time is HIGHER. Deeper staging (ns3 → 2 in
+  // flight) sustains more outstanding bytes and approaches peak — but NEVER
+  // exceeds it (capped), so ns3 gives a bounded win only up to peak BW. This is
+  // the mechanism by which numStages helps bandwidth-classified tiles (measured
+  // 256x128x64 ns3=1058 vs ns2=966). Applies to A/B DRAM traffic only (not C),
+  // async only; sync copy keeps the plain peak-BW floor.
+  double effMemPerIter = memPerIter;
+  if (cfg.useAsyncCopy && dramBwPerCU > 0.0 && numKIter > 0.0) {
+    const double dramBytesPerIter = tileBytesABperK * (1.0 - l2HitRate);
+    const double l2BytesPerIter   = tileBytesABperK * l2HitRate;
+    const double depth = std::max(1.0, effectivePipelineDepth);
+    const double outstandingBytes = depth * dramBytesPerIter;
+    const double achievedDramBw =
+        std::min(dramBwPerCU, outstandingBytes / hbmLatencyCycles);
+    const double effDramPerIter =
+        (achievedDramBw > 0.0) ? dramBytesPerIter / achievedDramBw : 0.0;
+    const double l2BwPerCU =
+        (hw.peakL2BwBytesPerCycle > 0.0)
+            ? hw.peakL2BwBytesPerCycle / std::max(hw.numCUs, 1)
+            : 0.0;
+    const double l2PerIter =
+        (l2BwPerCU > 0.0) ? l2BytesPerIter / l2BwPerCU : 0.0;
+    effMemPerIter = effDramPerIter + l2PerIter;
+  }
+
   // iter_latency = max(hbm_latency/depth, compute_per_iter, mem_bandwidth_per_iter)
   //
-  // The bandwidth term (memPerIter) is a HARD floor: pipelining/prefetch hides
+  // The bandwidth term (effMemPerIter) is a floor: pipelining/prefetch hides
   // memory *latency* (the HBM round-trip), but it cannot hide *bandwidth* — if a
   // K-block needs more bytes than the CU can move while computing, the iteration
-  // is bandwidth-bound regardless of pipeline depth. Omitting memPerIter let
-  // low-arithmetic-intensity tiles (e.g. 64x64x128, AI=32) report a high overlap
-  // and be misclassified as compute-bound, predicting near-peak TFLOPS for tiles
-  // that are actually memory-bound (and ~2-4x slower in practice).
+  // is bandwidth-bound. With Little's law the achievable bandwidth itself grows
+  // with pipeline depth (up to peak), so shallow pipelines carry a higher floor.
   const double iterLatency = std::max({
       (effectivePipelineDepth > 0.0) ? hbmLatencyCycles / effectivePipelineDepth : hbmLatencyCycles,
       computePerIter,
-      memPerIter});
+      effMemPerIter});
 
   // overlap = fraction of memory latency hidden by the pipeline.
   // When iterLatency == computePerIter: all memory hidden → overlap=1.
   // When iterLatency == hbm/depth: memory stalls, overlap < 1.
   const double pipelineOverlapGluon =
-      (iterLatency > 0.0 && memPerIter > 0.0)
-          ? std::min(1.0, 1.0 - (iterLatency - computePerIter) / memPerIter)
+      (iterLatency > 0.0 && effMemPerIter > 0.0)
+          ? std::min(1.0, 1.0 - (iterLatency - computePerIter) / effMemPerIter)
           : 1.0;
   est.pipelineOverlap = std::max(0.0, pipelineOverlapGluon);
 
@@ -1355,7 +1478,34 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // memory-bound shapes don't get falsely credited with "perfect overlap"
   // when wasted MFMA cycles happen to match memory time. This restores
   // the natural unhidden-serial penalty for shallow-pipeline configs.
-  const double inflatedComputeCycles = est.computeCycles / mfmaUtil;
+  // ── Realized MFMA compute efficiency (throughputCycles is a THEORETICAL
+  // reciprocal-throughput peak; real triton/aiter kernels reach only a
+  // fraction of it). Measured aiter gemm_a16w16 bf16 on gfx950: even at
+  // 8192^3 — where the GEMM is genuinely MFMA-limited in hardware — the
+  // achievable ceiling is ~1000 TF, i.e. ~0.40 of the 2500 TF theoretical
+  // peak. Without this de-rate the compute roofline is ~2.5x too optimistic,
+  // so any tile that flips compute-bound (e.g. 256x256) is predicted near
+  // peak and wrongly out-ranks genuinely-faster tiles.
+  //
+  // This inflates the COMPUTE ROOFLINE only (the max() term below) — NOT the
+  // final TFLOPS, NOT memory cycles, NOT the pipeline_overlap baseline. Tiles
+  // that are strongly memory-bound are unchanged; but near-boundary tiles WILL
+  // shift, because the de-rated compute roofline can now cross above memory —
+  // which is exactly the intended correction.
+  //
+  // Feature-dependent (measured, not a bare global): efficiency scales with
+  // min(BLOCK_M, BLOCK_N). Larger per-warp output tiles fill the MFMA pipeline
+  // with better back-to-back issue; a 64-dim tile issues MFMAs with worse
+  // overlap. Measured real/peak: min-dim 64 -> ~0.20, min-dim>=128 -> ~0.40.
+  //   efficiency = kPeakMfmaEff * min(1, min(BM,BN)/128)
+  constexpr double kPeakMfmaEff = 0.40; // achievable/theoretical MFMA ceiling
+  const int minTileDim = std::min(cfg.blockM, cfg.blockN);
+  const double mfmaEfficiency =
+      kPeakMfmaEff * std::min(1.0, static_cast<double>(minTileDim) / 128.0);
+  // Realized compute roofline: theoretical MFMA cycles inflated by both the
+  // lane-utilization waste (1/mfmaUtil) and the realized-efficiency de-rate.
+  const double inflatedComputeCycles =
+      est.computeCycles / (mfmaUtil * std::max(mfmaEfficiency, 0.05));
   const double maxCycles = std::max({inflatedComputeCycles, est.memoryCycles,
                                        est.ldsCycles});
   // For the overlap term, use min(compute, memory) as before — LDS overlaps
@@ -1365,8 +1515,12 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   const double unhiddenSerial = (1.0 - est.pipelineOverlap) * minCycles;
   est.effectiveTileCycles = maxCycles + unhiddenSerial;
 
-  est.isComputeBound = (est.computeCycles >= est.memoryCycles &&
-                        est.computeCycles >= est.ldsCycles);
+  // Compare against the DE-RATED compute roofline (inflatedComputeCycles), not
+  // the raw theoretical est.computeCycles: a tile whose realized compute
+  // roofline is the true bottleneck must be classified compute-bound so it does
+  // NOT eat the memory-bound step occupancy penalty on top of the de-rate.
+  est.isComputeBound = (inflatedComputeCycles >= est.memoryCycles &&
+                        inflatedComputeCycles >= est.ldsCycles);
 
   // ── Step 5: Predicted throughput ──────────────────────────────────────────
   //
@@ -1385,67 +1539,25 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   //
   // Saturation point: occupancy only matters until you have enough resident
   // waves to keep HBM busy through the issue queue. Empirically ~4 waves per
-  // SIMD is sufficient (= 0.4 of maxWavesPerSimd=10 on gfx950); past that,
+  // SIMD is sufficient (= 0.5 of maxWavesPerSimd=8 on gfx950); past that,
   // additional waves don't reduce HBM time. Without this cap, the penalty
-  // continuously rewards higher occupancy and structurally favours small
-  // tiles (more waves resident) over large tiles (fewer but with the same
-  // effective HBM saturation), even when the larger tile actually has much
-  // lower per-output HBM traffic.
-  // ── Origami-style tile-latency assembly ───────────────────────────────────
-  // Ported from rocm-libraries/shared/origami (gemm.cpp compute_tile_latency).
-  // Per-tile latency = per-K-iteration steady state (roofline) × num_iter, plus
-  // FIXED per-tile costs (prologue pipeline-fill + epilogue drain/store) whose
-  // exposure is reduced by occupancy (more resident waves overlap them), plus a
-  // per-iteration loop overhead. Total = per-tile latency × wave timesteps.
+  // rewards higher occupancy and structurally favours small tiles (more waves
+  // resident) over large tiles (fewer but with the same effective HBM
+  // saturation), even when the larger tile has much lower per-output HBM traffic.
   //
-  // The crucial idea vs a blanket occupancy penalty: occupancy decays only the
-  // FIXED costs (prologue/epilogue), not steady-state throughput. A low-
-  // occupancy tile pays full fill/drain; a high-occupancy tile amortises it.
-  // This is what distinguishes the SAME wide tile being good (lm_head, many
-  // waves) vs bad (attn_O, few waves).
+  // This is upstream's STEP penalty, kept as-is: compute-bound tiles pay no
+  // penalty (MFMA saturated); memory-bound tiles are divided by the (saturation-
+  // capped) VGPR occupancy. Note isComputeBound is now evaluated against the
+  // DE-RATED compute roofline (inflatedComputeCycles), so the realized-efficiency
+  // and Little's-law memory terms — not this switch — carry the fine-grained
+  // ranking; the step here only applies the coarse low-occupancy memory penalty.
+  const double saturationOccupancy =
+      4.0 / std::max(hw.maxWavesPerSimd, 1);
+  const double effectiveVgprOcc = std::min(vgprOccupancy, saturationOccupancy);
+  double occupancyPenalty =
+      est.isComputeBound ? 1.0 : (1.0 / std::max(effectiveVgprOcc, 0.25));
 
-  // Work utilization across M, N AND K (useful volume / launched volume): the
-  // tile-fill penalty, charged on steady state + prologue.
-  const double launchedM = ceildiv(prob.M, cfg.blockM) * (double)cfg.blockM;
-  const double launchedN = ceildiv(prob.N, cfg.blockN) * (double)cfg.blockN;
-  const double launchedK = ceildiv(prob.K, cfg.blockK) * (double)cfg.blockK;
-  const double utilization =
-      static_cast<double>(prob.M) * prob.N * prob.K /
-      std::max(1.0, launchedM * launchedN * launchedK);
-  const double tilePenalty = 1.0 / std::max(1e-9, utilization);
-
-  // Occupancy as a resident-wave count (Origami real_occupancy), decaying the
-  // fixed costs: occupancy_factor = OCCUPANCY_DECAY_BASE ^ waves.
-  constexpr double kOccupancyDecayBase = 0.95;
-  const double occWaves = std::max(1.0, est.occupancy * hw.maxWavesPerSimd);
-  const double occFactor = std::pow(kOccupancyDecayBase, occWaves);
-
-  // Per-K-iteration steady state (roofline: compute overlaps memory).
-  const double Lsingle =
-      std::max(computePerIter, memPerIter) * tilePenalty;
-
-  // Prologue: fill the pipeline with one K-block of A+B (= memPerIter).
-  const double Lprologue = memPerIter * tilePenalty * occFactor;
-
-  // Epilogue: drain (one K-block compute) + write the output tile to DRAM.
-  const double outWriteCycles =
-      (double)cfg.blockM * cfg.blockN * cBytes / std::max(1e-9, dramBwPerCU);
-  const double Lepilogue = (computePerIter + outWriteCycles) * occFactor;
-
-  // Per-iteration loop overhead (barrier + pointer math + branch), Origami's
-  // WEIGHT_LOOP_OVERHEAD. Scaled to this model's cycle units.
-  constexpr double kLoopOverheadCycles = 500.0;
-
-  const double numIter = std::max(1.0, numKIter - 1.0);
-  constexpr double kWeightPrologue = 1.5;
-  constexpr double kWeightEpilogue = 2.0;
-  double Ltile = Lsingle * numIter
-               + kWeightPrologue * Lprologue
-               + kWeightEpilogue * Lepilogue
-               + kLoopOverheadCycles * numIter;
-
-  // Total = per-tile latency × number of sequential wave timesteps.
-  double totalCycles = Ltile * static_cast<double>(est.numWaves);
+  double totalCycles = est.effectiveTileCycles * est.numWaves * occupancyPenalty;
 
   double totalFlops = 2.0 * prob.M * prob.N * prob.K * prob.batchSize;
 
@@ -1578,18 +1690,24 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
   else
     std::stable_sort(scored.begin(), scored.end(), cmp);
 
-  // Leave wavesPerEu at its default of 0 (= "compiler decides occupancy").
-  // The compiler allocates registers from each tile's actual demand, so it does
-  // NOT cap a big register-heavy tile at a fixed budget the way an explicit
-  // waves_per_eu hint does. The catastrophic 256x256 spill came precisely from
-  // aiter FORCING waves_per_eu=4 (→ 128-VGPR cap → 139 spills); emitting 0 lets
-  // the compiler give that tile the registers it needs (no spill). An explicit
-  // hint is only worth adding if benchmarking shows the compiler's own choice is
-  // suboptimal for some tile — to be revisited with measurements.
+  // Set waves_per_eu from the tile's computed occupancy (est.wavesPerSimd),
+  // but ONLY for register-heavy tiles (occupancy 1..3). For these the
+  // compiler's default choice is measurably suboptimal — e.g. 256x256 at
+  // waves_per_eu=0 leaves ~0.76x on the table for attn_QKV/lm_head 8192;
+  // emitting the model's occupancy (2) recovers it (→ ~1.0x, aiter geomean
+  // 1.033 -> 1.062). Everything else (occupancy >= 4, register-light) is left
+  // at 0 = "compiler decides", which is already optimal there. occupancy == 4
+  // is deliberately NOT emitted: an explicit waves_per_eu=4 trips a Triton/LLVM
+  // codegen assertion on some configs, and 4 is the common default anyway.
   std::vector<TritonGemmConfig> result;
   result.reserve(k);
-  for (size_t i = 0; i < k; ++i)
-    result.push_back(configs[scored[i].idx]);
+  for (size_t i = 0; i < k; ++i) {
+    TritonGemmConfig c = configs[scored[i].idx];
+    const int occ = scored[i].est.wavesPerSimd;
+    if (occ > 0 && occ < 4)
+      c.wavesPerEu = occ;
+    result.push_back(c);
+  }
   return result;
 }
 
