@@ -143,6 +143,35 @@ std::optional<MfmaInstrInfo> getMfmaInstrInfo(Arch arch, int mDim, int nDim,
 // 3. GEMM problem and kernel configuration
 //===----------------------------------------------------------------------===//
 
+/// Storage/packing layout family of one GEMM operand.
+enum class OperandLayout {
+  Dense,     ///< plain values, no scales (fp16/bf16/fp8/int8/fp32)
+  MXPacked,  ///< MXFP4/MXFP6: packed sub-byte values + E8M0 scale per K-group(32)
+  NVPacked,  ///< NVFP4-style (E4M3 scale, different group) — reserved, NYI
+};
+
+/// Per-operand storage descriptor. Centralizes sub-byte / block-scaled metadata
+/// so byte-traffic, LDS and VGPR accounting route through helpers instead of
+/// hardcoding packed sizes, scale groups, or `if (kind == FP4)` checks.
+struct OperandDesc {
+  ElemKind kind = ElemKind::FP16;
+  int bits = 16;                            ///< value bits (4 fp4, 8 fp8, 16 fp16)
+  OperandLayout layout = OperandLayout::Dense;
+  int scaleBits = 0;                        ///< scale element width (8 = E8M0), 0 if none
+  int scaleGroupK = 0;                      ///< values per scale block (32 for MXFP4)
+  bool packed = false;                      ///< sub-byte values stored packed
+};
+
+/// Build an OperandDesc from an element kind + declared value bit width,
+/// inferring the layout (FP4/FP6 → MXPacked with E8M0 scales per 32).
+OperandDesc makeOperandDesc(ElemKind kind, int bits);
+
+/// Operand accounting helpers — the single source of packed/scale byte logic.
+double valueBytes(const OperandDesc &op);          ///< packed value bytes/elem
+double scaleBytesPerValue(const OperandDesc &op);  ///< interleaved scale bytes/elem
+double memoryBytesPerValue(const OperandDesc &op); ///< value + scale bytes/elem
+bool hasMxScales(const OperandDesc &op);           ///< block-scaled operand?
+
 /// Describes the mathematical GEMM problem being compiled.
 ///
 /// GROUPED / MoE CONTRACT: for a grouped (fused-MoE) GEMM the caller MUST set
@@ -165,6 +194,12 @@ struct GemmProblem {
   int aBits = 16;  ///< sizeof(a_elem) * 8  (4 for FP4, 8 for FP8, …)
   int bBits = 16;
   int cBits = 32;
+
+  // Operand layout descriptors, DERIVED from the (kind,bits) fields above which
+  // remain the source of truth (the pybind constructor sets them). Migration
+  // step 1: accounting code consumes these; a later step may make them stored.
+  OperandDesc aDesc() const { return makeOperandDesc(aKind, aBits); }
+  OperandDesc bDesc() const { return makeOperandDesc(bKind, bBits); }
 };
 
 /// Describes a candidate Triton GEMM kernel configuration.

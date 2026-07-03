@@ -286,6 +286,37 @@ static ElemKind mfmaComputeKind(ElemKind a, ElemKind b) {
   return (bb > ab) ? b : a;   // widest → dequant to wide-MFMA rate
 }
 
+// ── Operand layout metadata (single source of packed/scale byte logic) ───────
+OperandDesc makeOperandDesc(ElemKind kind, int bits) {
+  OperandDesc d;
+  d.kind = kind;
+  d.bits = bits;
+  // MXFP4 / MXFP6: sub-byte values packed, with an E8M0 scale per 32-value block.
+  if (kind == ElemKind::FP4 || kind == ElemKind::FP6) {
+    d.layout = OperandLayout::MXPacked;
+    d.scaleBits = 8;    // E8M0
+    d.scaleGroupK = 32; // MXFP4/6 block size
+    d.packed = true;
+  }
+  return d;
+}
+
+double valueBytes(const OperandDesc &op) { return op.bits / 8.0; }
+
+double scaleBytesPerValue(const OperandDesc &op) {
+  return (op.layout != OperandLayout::Dense && op.scaleGroupK > 0)
+             ? static_cast<double>(op.scaleBits) / (8.0 * op.scaleGroupK)
+             : 0.0;
+}
+
+double memoryBytesPerValue(const OperandDesc &op) {
+  return valueBytes(op) + scaleBytesPerValue(op);
+}
+
+bool hasMxScales(const OperandDesc &op) {
+  return op.layout != OperandLayout::Dense;
+}
+
 ElemKind elemKindFromBits(int bits, bool isFloat, bool isBF) {
   if (!isFloat) {
     if (bits == 8) return ElemKind::I8;
@@ -614,14 +645,19 @@ int estimateVgpr(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // the same tile barely spills (~9). This is a geometry+bytes term (weight is
   // sub-byte), NOT a dtype/block_m switch: block_m enters only via the tile.
   int vgprScaledWeight = 0;
-  if (prob.bKind == ElemKind::FP4 || prob.bKind == ElemKind::FP6) {
-    // Dequant temporaries: B fragment materialized at ~bf16 width (2 B).
+  const OperandDesc bDesc = prob.bDesc();
+  if (hasMxScales(bDesc)) {
+    // Dequant temporaries: packed weight fragment materialized at ~bf16 width.
+    constexpr int dequantBytes = 2;
     const int vgprBDequant =
-        (cfg.blockN * kWidth * 2 + ws * bytesPerVgpr - 1) / (ws * bytesPerVgpr);
-    // mxfp4 block scales: 1 B (E8M0) per 32 weight elements, held live.
-    const int scaleElems = (cfg.blockN * kWidth + 31) / 32;
+        (cfg.blockN * kWidth * dequantBytes + ws * bytesPerVgpr - 1) /
+        (ws * bytesPerVgpr);
+    // E8M0 block scales held live: scaleBits per scaleGroupK weight elements.
+    const int scaleElems =
+        (cfg.blockN * kWidth + bDesc.scaleGroupK - 1) / bDesc.scaleGroupK;
+    const int scaleBytesTot = scaleElems * bDesc.scaleBits / 8;
     const int vgprScale =
-        (scaleElems + ws * bytesPerVgpr - 1) / (ws * bytesPerVgpr);
+        (scaleBytesTot + ws * bytesPerVgpr - 1) / (ws * bytesPerVgpr);
     vgprScaledWeight = (vgprBDequant + vgprScale) * liveFragsMultiplier;
   }
 
@@ -669,9 +705,8 @@ int estimateLdsBytes(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // a8w4 LDS isn't over-counted (which wrongly marked winner configs invalid).
   const int aBytesInt = (prob.aBits + 7) / 8;
   const int bBytesInt = (prob.bBits + 7) / 8;
-  const double aBytes = prob.aBits / 8.0;
-  const bool bMxLds = (prob.bKind == ElemKind::FP4 || prob.bKind == ElemKind::FP6);
-  const double bBytes = prob.bBits / 8.0 + (bMxLds ? 1.0 / 32.0 : 0.0);
+  const double aBytes = memoryBytesPerValue(prob.aDesc());
+  const double bBytes = memoryBytesPerValue(prob.bDesc());
 
   if (cfg.useAsyncCopy) {
     // ── Calibrated async PaddedSharedEncoding footprint (verified common case).
@@ -1271,12 +1306,8 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // scale per 32 weight elements; that follows the B (weight) stream, so we fold
   // it into an effective weight byte: bBytesEff = bits/8 + 1/32. (Activation is
   // static-scale fp8 for gpt-oss → its scale is a scalar, negligible.)
-  const double aBytesF = prob.aBits / 8.0;
-  const bool bIsMxScaled =
-      (prob.bKind == ElemKind::FP4 || prob.bKind == ElemKind::FP6);
-  constexpr double kMxScaleBytesPerElem = 1.0 / 32.0; // 1B E8M0 per 32 elems
-  const double bBytesF =
-      prob.bBits / 8.0 + (bIsMxScaled ? kMxScaleBytesPerElem : 0.0);
+  const double aBytesF = memoryBytesPerValue(prob.aDesc());
+  const double bBytesF = memoryBytesPerValue(prob.bDesc());
   const int cBytes = (prob.cBits + 7) / 8;
 
   // Per K-block fetch (one stage worth of A+B, incl. weight block scales).
