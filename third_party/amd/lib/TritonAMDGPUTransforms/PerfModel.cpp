@@ -625,16 +625,24 @@ int estimateVgpr(const GemmProblem &prob, const TritonGemmConfig &cfg,
       (cfg.blockN * kWidth * bBytes + ws * bytesPerVgpr - 1) /
       (ws * bytesPerVgpr);
 
-  // Multiple A/B fragments are live simultaneously due to:
-  //   (1) software pipeline depth (numBuffers stages → that many loaded operands)
-  //   (2) K-loop unroll factor (Triton unrolls to fill issue slots when per-iter
-  //       work is small — e.g. sub-mfma-tile per-warp configs, low numKIter)
-  // The unroll factor scales inversely with effective per-iter MFMA work, where
-  // effective work = mfmaPerIterPerWarp × mfmaUtil (sub-mfma-tile MFMAs count
-  // less because each one produces fewer useful output lanes). Target body
-  // size = 8 useful MFMAs per iteration — empirical calibration against AMDGCN
-  // dumps. (Fix 6, 2026-06-07.)
-  int liveFragsMultiplier = estimateNumBuffers(cfg);
+  // Live register-resident A/B fragments. This is driven ONLY by the K-loop
+  // unroll factor — NOT by software-pipeline depth.
+  //
+  // num_stages/numBuffers deepens the *LDS* double-buffer (numBuffers × tiles,
+  // already charged in estimateLdsBytes): with the CDNA4 async global→LDS
+  // pipeline the in-flight stages sit in LDS, and only the fragment currently
+  // feeding the MFMA is in VGPR. Multiplying the fragment count by numBuffers
+  // double-counted that storage and added ~112 VGPR per extra stage
+  // (a8w4 BN256/BK256/nw8: 208→320→432), which false-flagged the real ns2
+  // winners as spilling and made them is_valid=false — even though measured
+  // n_regs grows only ~13/stage (174→187) with n_spills=0 (Fix, 2026-06-26).
+  //
+  // The K-loop unroll factor DOES keep several fragments live at once (Triton
+  // unrolls to fill issue slots when per-iter work is small — sub-mfma-tile
+  // per-warp configs, low numKIter). It scales inversely with effective per-iter
+  // MFMA work (mfmaPerIterPerWarp × mfmaUtil); target body = 8 useful MFMAs/iter,
+  // calibrated against AMDGCN dumps. (Fix 6, 2026-06-07.)
+  int liveFragsMultiplier = 1;
   {
     auto info = getMfmaInstrInfo(hw.arch, cfg.mfmaNonKDim > 0 ? cfg.mfmaNonKDim : 16,
                                   cfg.mfmaNonKDim > 0 ? cfg.mfmaNonKDim : 16,
@@ -657,7 +665,7 @@ int estimateVgpr(const GemmProblem &prob, const TritonGemmConfig &cfg,
       constexpr double targetBodyWork = 8.0;
       int unrollFactor = std::clamp(
           static_cast<int>(std::ceil(targetBodyWork / effectiveWork)), 1, 8);
-      liveFragsMultiplier *= unrollFactor;
+      liveFragsMultiplier = unrollFactor;
     }
   }
   const int vgprAFrag = vgprAFragBase * liveFragsMultiplier;
