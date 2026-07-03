@@ -606,12 +606,32 @@ int estimateVgpr(const GemmProblem &prob, const TritonGemmConfig &cfg,
   const int vgprAFrag = vgprAFragBase * liveFragsMultiplier;
   const int vgprBFrag = vgprBFragBase * liveFragsMultiplier;
 
+  // Scaled low-precision weight (mxfp4/mxfp6): the packed sub-byte weight is
+  // UNPACKED and SCALED into wider registers for the f8f6f4 scaled MFMA, and the
+  // E8M0 block scales are held live. The packed bBytes above (1B for 4-bit)
+  // under-counts this live footprint — measured on gfx950 the fp4 kernel spills
+  // 140-309 regs on big tiles where the base estimate shows none, while bf16 at
+  // the same tile barely spills (~9). This is a geometry+bytes term (weight is
+  // sub-byte), NOT a dtype/block_m switch: block_m enters only via the tile.
+  int vgprScaledWeight = 0;
+  if (prob.bKind == ElemKind::FP4 || prob.bKind == ElemKind::FP6) {
+    // Dequant temporaries: B fragment materialized at ~bf16 width (2 B).
+    const int vgprBDequant =
+        (cfg.blockN * kWidth * 2 + ws * bytesPerVgpr - 1) / (ws * bytesPerVgpr);
+    // mxfp4 block scales: 1 B (E8M0) per 32 weight elements, held live.
+    const int scaleElems = (cfg.blockN * kWidth + 31) / 32;
+    const int vgprScale =
+        (scaleElems + ws * bytesPerVgpr - 1) / (ws * bytesPerVgpr);
+    vgprScaledWeight = (vgprBDequant + vgprScale) * liveFragsMultiplier;
+  }
+
   // Miscellaneous overhead: base pointers, loop induction variables, predicates
   // and a small stack frame.  28 is an empirical constant calibrated against
   // AMDGCN assembly of representative Triton GEMM kernels.
   constexpr int vgprMisc = 28;
 
-  const int total = vgprAccum + vgprAFrag + vgprBFrag + vgprMisc;
+  const int total =
+      vgprAccum + vgprAFrag + vgprBFrag + vgprScaledWeight + vgprMisc;
   // Round up to the allocation granularity.
   return ((total + hw.vgprAllocGranule - 1) / hw.vgprAllocGranule) *
          hw.vgprAllocGranule;
@@ -1108,12 +1128,15 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
       ((std::max(1, est.vgprCount) + granule - 1) / granule) * granule;
   est.wavesPerSimd =
       std::min(hw.maxWavesPerSimd, hw.vgprPerSimd / std::max(1, vgprAligned));
-  // Heuristic spill threshold: if < 1 wave fits, we hard-spill.
-  // Light spill threshold scales with the VGPR file size: 75% of vgprPerSimd.
-  // On CDNA3 (256 VGPRs) this is ~192; on CDNA4 (512 VGPRs) this is ~384.
-  const int spillThreshold = (hw.vgprPerSimd * 3) / 4;
-  est.likelySpills = (est.vgprCount > hw.vgprPerSimd) ||
-                     (est.wavesPerSimd == 1 && est.vgprCount > spillThreshold);
+  // Spill threshold = per-wave addressable archVGPR limit. A wavefront can
+  // address at most ~256 archVGPRs on CDNA(3/4); register DEMAND beyond that
+  // spills to scratch regardless of the 512-entry physical file (which only
+  // governs occupancy). Calibrated to measured gfx950 spills: fp4 big tiles
+  // (demand >256, incl. dequant+scale regs) spill 140-309; bf16 256x256
+  // (demand ~224) does not. The old 384/512 thresholds only fired at wps==1
+  // and missed the fp4 spill cliff entirely.
+  const int archVgprPerWave = std::min(hw.vgprPerSimd, 256);
+  est.likelySpills = (est.vgprCount > archVgprPerWave);
 
   // CTA-limited occupancy from LDS.
   int ctasFromLds = (est.ldsBytes > 0)

@@ -453,6 +453,7 @@ void init_triton_amd_perf_model(py::module &&m) {
       .def_readonly("wave_efficiency",     &PerfEstimate::waveEfficiency)
       .def_readonly("lds_exceeded",        &PerfEstimate::ldsExceeded)
       .def_readonly("likely_spills",       &PerfEstimate::likelySpills)
+      .def_readonly("vgpr_count",          &PerfEstimate::vgprCount)
       .def_readonly("num_buffers",          &PerfEstimate::numBuffers)
       .def_readonly("waves_per_simd",       &PerfEstimate::wavesPerSimd)
       .def_readonly("ctas_per_cu",          &PerfEstimate::ctasPerCU)
