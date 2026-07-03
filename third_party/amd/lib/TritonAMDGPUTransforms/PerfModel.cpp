@@ -317,6 +317,32 @@ bool hasMxScales(const OperandDesc &op) {
   return op.layout != OperandLayout::Dense;
 }
 
+// CDNA4 swizzled MX-scale correctness rule (NOT a tuning knob). When the
+// block-scaled weight uses the swizzled scale path, unswizzle_mx_scale_cdna4
+// reshapes the per-block scales as [.., MX_SCALE_BLOCK_K/8, ..] where
+// MX_SCALE_BLOCK_K = BLOCK_K / scaleGroup. That requires BLOCK_K/scaleGroup to be
+// a POSITIVE MULTIPLE OF 8 → for the 32-wide MXFP4 group, BLOCK_K >= 256 and
+// BLOCK_K % 256 == 0 (BK=128 gives a 0-sized reshape dim → invalid/crash). The
+// swizzle is used only when the weight is block-scaled AND the shape is eligible
+// (kernel gate: N % 32 == 0 && K % 256 == 0). Dense / non-swizzled layouts and
+// non-eligible shapes are unaffected.
+static constexpr int kSwizzleScaleReshapeFactor = 8; // unswizzle inner //8
+static bool swizzledScaleBlockKValid(const GemmProblem &prob,
+                                     const TritonGemmConfig &cfg) {
+  const OperandDesc bD = prob.bDesc();
+  if (!hasMxScales(bD) || bD.scaleGroupK <= 0)
+    return true; // not block-scaled → no swizzle reshape
+  const int64_t swizzleGate =
+      static_cast<int64_t>(bD.scaleGroupK) * kSwizzleScaleReshapeFactor; // 256
+  const bool swizzled =
+      (prob.N % bD.scaleGroupK == 0) && (prob.K % swizzleGate == 0);
+  if (!swizzled)
+    return true; // swizzled scale path not used for this shape
+  const int scaleKPerBlock = cfg.blockK / bD.scaleGroupK;
+  return scaleKPerBlock >= kSwizzleScaleReshapeFactor &&
+         (scaleKPerBlock % kSwizzleScaleReshapeFactor) == 0; // BLOCK_K % 256 == 0
+}
+
 ElemKind elemKindFromBits(int bits, bool isFloat, bool isBF) {
   if (!isFloat) {
     if (bits == 8) return ElemKind::I8;
@@ -1685,7 +1711,8 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
                 !est.likelySpills &&
                 (cfg.numWarps > 0) &&
                 ((cfg.numWarps & (cfg.numWarps - 1)) == 0) && // power of two
-                (cfg.blockK > 0) && (cfg.blockM > 0) && (cfg.blockN > 0);
+                (cfg.blockK > 0) && (cfg.blockM > 0) && (cfg.blockN > 0) &&
+                swizzledScaleBlockKValid(prob, cfg); // MX swizzle: BLOCK_K%256==0
 
   return est;
 }
@@ -1716,6 +1743,10 @@ bool isValidConfig(const GemmProblem &prob, const TritonGemmConfig &cfg,
   auto infoOpt =
       getMfmaInstrInfo(hw.arch, mDim, mDim, mfmaComputeKind(prob.aDesc(), prob.bDesc()), prob.cKind);
   if (infoOpt && (cfg.blockK % infoOpt->kDim) != 0)
+    return false;
+
+  // Swizzled MX-scale path requires BLOCK_K % 256 == 0 (correctness).
+  if (!swizzledScaleBlockKValid(prob, cfg))
     return false;
 
   return true;
