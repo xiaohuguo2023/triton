@@ -278,12 +278,12 @@ int elemKindBits(ElemKind k) {
 //     standard wide MFMA runs at the WIDER operand's rate. Using the narrowest
 //     here would wrongly cost a16wfp4 at the fp4 rate (4× too fast).
 // Same-type GEMMs (a16w16, a8w8) return the unchanged kind either way.
-static ElemKind mfmaComputeKind(ElemKind a, ElemKind b) {
-  const int ab = elemKindBits(a), bb = elemKindBits(b);
+static ElemKind mfmaComputeKind(const OperandDesc &a, const OperandDesc &b) {
+  const int ab = a.bits, bb = b.bits;
   const bool bothLowPrec = (ab <= 8) && (bb <= 8); // f8f6f4 scaled-MFMA eligible
   if (bothLowPrec)
-    return (bb < ab) ? b : a; // narrowest → scaled f8f6f4 class rate
-  return (bb > ab) ? b : a;   // widest → dequant to wide-MFMA rate
+    return (bb < ab) ? b.kind : a.kind; // narrowest → scaled f8f6f4 class rate
+  return (bb > ab) ? b.kind : a.kind;   // widest → dequant to wide-MFMA rate
 }
 
 // ── Operand layout metadata (single source of packed/scale byte logic) ───────
@@ -477,7 +477,7 @@ int selectMfmaNonKDim(const GemmProblem &prob, const TritonGemmConfig &cfg,
   double bestThroughput = -1.0;
 
   for (const auto &e : kMfmaThroughputTable) {
-    if (e.arch != hw.arch || e.aKind != mfmaComputeKind(prob.aKind, prob.bKind) || e.cKind != prob.cKind)
+    if (e.arch != hw.arch || e.aKind != mfmaComputeKind(prob.aDesc(), prob.bDesc()) || e.cKind != prob.cKind)
       continue;
     // Only consider square MFMA tiles (mDim == nDim).
     if (e.mDim != e.nDim)
@@ -550,7 +550,7 @@ static int deriveKWidth(const GemmProblem &prob, const TritonGemmConfig &cfg,
                        ? cfg.mfmaNonKDim
                        : selectMfmaNonKDim(prob, cfg, hw);
 
-  auto infoOpt = getMfmaInstrInfo(hw.arch, mDim, mDim, mfmaComputeKind(prob.aKind, prob.bKind), prob.cKind);
+  auto infoOpt = getMfmaInstrInfo(hw.arch, mDim, mDim, mfmaComputeKind(prob.aDesc(), prob.bDesc()), prob.cKind);
   if (!infoOpt)
     return 8; // safe fallback for unknown intrinsics
 
@@ -612,7 +612,7 @@ int estimateVgpr(const GemmProblem &prob, const TritonGemmConfig &cfg,
   {
     auto info = getMfmaInstrInfo(hw.arch, cfg.mfmaNonKDim > 0 ? cfg.mfmaNonKDim : 16,
                                   cfg.mfmaNonKDim > 0 ? cfg.mfmaNonKDim : 16,
-                                  mfmaComputeKind(prob.aKind, prob.bKind), prob.cKind);
+                                  mfmaComputeKind(prob.aDesc(), prob.bDesc()), prob.cKind);
     if (info) {
       auto ceildiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
       int64_t mfmaPerKBlock =
@@ -1248,7 +1248,7 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   const double numKIter =
       (cfg.blockK > 0) ? static_cast<double>(prob.K) / cfg.blockK : 1.0;
 
-  auto infoOpt = getMfmaInstrInfo(hw.arch, mDim, mDim, mfmaComputeKind(prob.aKind, prob.bKind), prob.cKind);
+  auto infoOpt = getMfmaInstrInfo(hw.arch, mDim, mDim, mfmaComputeKind(prob.aDesc(), prob.bDesc()), prob.cKind);
   if (!infoOpt) {
     infoOpt = getMfmaInstrInfo(hw.arch, 16, 16, ElemKind::FP16, ElemKind::FP32);
   }
@@ -1714,7 +1714,7 @@ bool isValidConfig(const GemmProblem &prob, const TritonGemmConfig &cfg,
   int mDim = cfg.mfmaNonKDim > 0 ? cfg.mfmaNonKDim
                                   : selectMfmaNonKDim(prob, cfg, hw);
   auto infoOpt =
-      getMfmaInstrInfo(hw.arch, mDim, mDim, mfmaComputeKind(prob.aKind, prob.bKind), prob.cKind);
+      getMfmaInstrInfo(hw.arch, mDim, mDim, mfmaComputeKind(prob.aDesc(), prob.bDesc()), prob.cKind);
   if (infoOpt && (cfg.blockK % infoOpt->kDim) != 0)
     return false;
 
@@ -1838,7 +1838,7 @@ generateCandidates(const GemmProblem &prob, const HardwareInfo &hw,
   // Look up kDim from the throughput table for this arch+dtype combination.
   int mfmaKDim = 16; // safe default
   if (auto info = getMfmaInstrInfo(hw.arch, mfmaDim, mfmaDim,
-                                   mfmaComputeKind(prob.aKind, prob.bKind),
+                                   mfmaComputeKind(prob.aDesc(), prob.bDesc()),
                                    prob.cKind))
     mfmaKDim = info->kDim;
 
