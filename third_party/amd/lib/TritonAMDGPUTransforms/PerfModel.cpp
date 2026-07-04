@@ -1648,12 +1648,35 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
       est.computeCycles / (mfmaUtil * std::max(mfmaEfficiency, 0.05));
   const double maxCycles = std::max({inflatedComputeCycles, est.memoryCycles,
                                        est.ldsCycles});
-  // For the overlap term, use min(compute, memory) as before — LDS overlaps
-  // with both compute (operand staging is part of the mfma pipeline) and
-  // memory (different HW unit), so it doesn't add unhidden serial latency.
-  const double minCycles = std::min(est.computeCycles, est.memoryCycles);
-  const double unhiddenSerial = (1.0 - est.pipelineOverlap) * minCycles;
-  est.effectiveTileCycles = maxCycles + unhiddenSerial;
+  if (hasMxScales(prob.bDesc())) {
+    // MX-scaled low-precision path (a8w4 / mxfp4): Origami-style pipeline
+    // fill/steady tile latency (compute_tile_latency). A depth-numStages
+    // software pipeline needs (numStages-1) K-iterations to FILL before
+    // compute/memory reach steady-state overlap; only steady iterations overlap
+    // (max), fill iterations run serial (compute+mem+lds). On a short K-loop
+    // (small-K / large-BK, common in a8w4 MoE) a deep pipeline never fills, so
+    // ns1 correctly beats ns3 — fixing the ns/BK over-credit (wpe=0 top-1 rank
+    // 0.75 -> ~0.96). Uses the RAW compute roofline (the bf16 mfmaUtil de-rate
+    // is miscalibrated for the fp4 scaled-MFMA and hurts fp4 ranking). Gated on
+    // hasMxScales so the bf16/dense path below is byte-identical (untouched).
+    const double kIters      = std::max(1.0, numKIter);
+    const double perCompute  = est.computeCycles / kIters;
+    const double perMem      = est.memoryCycles / kIters;
+    const double perLds      = est.ldsCycles / kIters;
+    const double fillIters   = std::min(kIters, static_cast<double>(std::max(0, cfg.numStages - 1)));
+    const double steadyIters = std::max(0.0, kIters - fillIters);
+    est.effectiveTileCycles =
+        steadyIters * std::max({perCompute, perMem, perLds}) +
+        fillIters * (perCompute + perMem + perLds);
+  } else {
+    // bf16 / dense path (unchanged).
+    // For the overlap term, use min(compute, memory) as before — LDS overlaps
+    // with both compute (operand staging is part of the mfma pipeline) and
+    // memory (different HW unit), so it doesn't add unhidden serial latency.
+    const double minCycles = std::min(est.computeCycles, est.memoryCycles);
+    const double unhiddenSerial = (1.0 - est.pipelineOverlap) * minCycles;
+    est.effectiveTileCycles = maxCycles + unhiddenSerial;
+  }
 
   // Compare against the DE-RATED compute roofline (inflatedComputeCycles), not
   // the raw theoretical est.computeCycles: a tile whose realized compute
