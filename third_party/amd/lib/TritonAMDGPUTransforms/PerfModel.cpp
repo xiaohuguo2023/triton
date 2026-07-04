@@ -1721,6 +1721,15 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
       est.isComputeBound ? 1.0 : (1.0 / std::max(effectiveVgprOcc, 0.25));
 
   double totalCycles = est.effectiveTileCycles * est.numWaves * occupancyPenalty;
+  // Charge the partial last wave: with numWaves scheduling waves, the final wave
+  // occupies only waveEfficiency of the CUs, so the tiles-per-CU (and thus the
+  // wall-clock) is higher than numWaves alone implies. This is the "/ waveEff"
+  // the total-cycles comment describes but the line above omitted. It penalizes
+  // coarse tilings (large BN -> fewer, less-balanced waves) that the compute-
+  // bound total otherwise over-credits — e.g. a8w4 BN256 (waveEff 0.75) vs BN128
+  // (1.0). Gated on hasMxScales so the validated bf16/dense ranking is untouched.
+  if (hasMxScales(prob.bDesc()) && est.waveEfficiency > 0.0)
+    totalCycles /= std::max(est.waveEfficiency, 0.5);
 
   double totalFlops = 2.0 * prob.M * prob.N * prob.K * prob.batchSize;
 
