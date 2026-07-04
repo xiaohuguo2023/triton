@@ -1660,8 +1660,17 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
     // is miscalibrated for the fp4 scaled-MFMA and hurts fp4 ranking). Gated on
     // hasMxScales so the bf16/dense path below is byte-identical (untouched).
     const double kIters      = std::max(1.0, numKIter);
+    // Active-CU bandwidth: when a (single) scheduling wave has fewer tiles than
+    // CUs, only those CUs are active and each gets a larger share of DRAM BW, so
+    // the per-tile memory time is lower than peakBW/numCUs implies. memoryCycles
+    // was computed with the full-numCUs share; scale it by the active fraction
+    // for a partial single wave. Fixes BN256 (128 tiles < 256 CUs) being charged
+    // full memory and losing to BN128, when it is actually faster.
+    double memCycles = est.memoryCycles;
+    if (est.numWaves <= 1 && hw.numCUs > 0)
+      memCycles *= std::min(1.0, static_cast<double>(est.totalOutputTiles) / hw.numCUs);
     const double perCompute  = est.computeCycles / kIters;
-    const double perMem      = est.memoryCycles / kIters;
+    const double perMem      = memCycles / kIters;
     const double perLds      = est.ldsCycles / kIters;
     const double fillIters   = std::min(kIters, static_cast<double>(std::max(0, cfg.numStages - 1)));
     const double steadyIters = std::max(0.0, kIters - fillIters);
