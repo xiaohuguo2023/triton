@@ -1699,11 +1699,23 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
     const double perCompute  = est.computeCycles / kIters;
     const double perMem      = memCycles / kIters;
     const double perLds      = est.ldsCycles / kIters;
-    const double fillIters   = std::min(kIters, static_cast<double>(std::max(0, cfg.numStages - 1)));
-    const double steadyIters = std::max(0.0, kIters - fillIters);
-    est.effectiveTileCycles =
-        steadyIters * std::max({perCompute, perMem, perLds}) +
-        fillIters * (perCompute + perMem + perLds);
+    // Software pipelining needs >=2 buffers to overlap load[i+1] with compute[i].
+    // num_stages<=1 (single buffer) has NO overlap: every K-iteration runs
+    // load THEN compute serially (compute+mem+lds summed). Only num_stages>=2
+    // gets the (numStages-1) fill iters + overlapped steady iters. The previous
+    // code set fillIters=0 for ns1, which modeled ns1 as fully overlapped
+    // (all-steady) — a fictitious discount that made the model rank ns1 as the
+    // fastest config, even though aiter never emits ns=1 on CDNA4 and it has no
+    // pipeline at all. Charge ns1 the full serial cost so ns>=2 correctly wins.
+    if (cfg.numStages <= 1) {
+      est.effectiveTileCycles = kIters * (perCompute + perMem + perLds);
+    } else {
+      const double fillIters   = std::min(kIters, static_cast<double>(cfg.numStages - 1));
+      const double steadyIters = std::max(0.0, kIters - fillIters);
+      est.effectiveTileCycles =
+          steadyIters * std::max({perCompute, perMem, perLds}) +
+          fillIters * (perCompute + perMem + perLds);
+    }
   } else {
     // bf16 / dense path (unchanged).
     // For the overlap term, use min(compute, memory) as before — LDS overlaps
@@ -1755,6 +1767,25 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   const double effectiveVgprOcc = std::min(vgprOccupancy, saturationOccupancy);
   double occupancyPenalty =
       est.isComputeBound ? 1.0 : (1.0 / std::max(effectiveVgprOcc, 0.25));
+
+  // a8w4 correction: the compute de-rate inflates compute for tall block_m=16
+  // tiles (the minTileDim/128 efficiency factor), which can mis-classify a
+  // genuinely memory-bound wide-BN tile (e.g. block_m=16 × BN=512, where raw
+  // compute << memory) as compute-bound — letting it escape the low-occupancy
+  // penalty and over-rank BN512 at prefill (BN512 was measured ~13% slower than
+  // BN128 yet the model ranked it fastest). If the RAW (un-de-rated) compute is
+  // below memory, the tile is really memory-bound: apply the occupancy penalty
+  // regardless of the de-rated isComputeBound flag. MX-scaled B only, so the
+  // validated bf16/dense ranking (no MX scales on B) is untouched.
+  // Only in the SATURATED regime (enough tiles to fill all CUs): the low-occupancy
+  // latency-hiding penalty is physical only when the GPU is actually full. At
+  // decode / small-M (totalOutputTiles < numCUs) the GPU is under-filled — the
+  // bottleneck is under-utilization, not latency hiding — and applying this
+  // penalty there wrongly pushes the pick to over-narrow BN. Gate on saturation.
+  if (hasMxScales(prob.bDesc()) && occupancyPenalty == 1.0 &&
+      est.computeCycles < est.memoryCycles &&
+      est.totalOutputTiles >= hw.numCUs)
+    occupancyPenalty = 1.0 / std::max(effectiveVgprOcc, 0.25);
 
   double totalCycles = est.effectiveTileCycles * est.numWaves * occupancyPenalty;
   // Charge the partial last wave: with numWaves scheduling waves, the final wave
