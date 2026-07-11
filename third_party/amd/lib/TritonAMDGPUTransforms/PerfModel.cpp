@@ -464,13 +464,36 @@ static constexpr ThroughputEntry kMfmaThroughputTable[] = {
 };
 // clang-format on
 
+// The MFMA engine accumulates in a fixed type determined by the INPUT operands,
+// not by the requested output/store dtype: all float MFMA (FP16/BF16/FP8/FP6/
+// FP4/TF32) accumulate in FP32; FP64 in FP64; integer (I8) in I32/I8. The
+// throughput table is keyed on this accumulator kind. Callers pass the problem's
+// output cKind (which may be BF16/FP8 for the real epilogue-store dtype), so we
+// must normalize it to the accumulator kind before matching — otherwise a bf16
+// output silently fails the table lookup (no bf16-cKind rows exist), which
+// mis-picks mfmaDim and can empty the candidate list. The output store dtype is
+// accounted for separately via prob.cBits in estimateVgpr.
+static ElemKind mfmaAccumKind(ElemKind computeKind) {
+  switch (computeKind) {
+  case ElemKind::FP64:
+    return ElemKind::FP64;
+  case ElemKind::I8:
+    return ElemKind::I8;
+  default:
+    return ElemKind::FP32; // all float MFMA accumulate in FP32
+  }
+}
+
 std::optional<MfmaInstrInfo> getMfmaInstrInfo(Arch arch, int mDim, int nDim,
                                                ElemKind aKind, ElemKind cKind) {
+  // Match on the MFMA accumulator kind (derived from the inputs), not the
+  // passed output cKind — see mfmaAccumKind above.
+  const ElemKind accKind = mfmaAccumKind(aKind);
   for (const auto &e : kMfmaThroughputTable) {
     if (e.arch == arch && e.mDim == mDim && e.nDim == nDim &&
-        e.aKind == aKind && e.cKind == cKind) {
+        e.aKind == aKind && e.cKind == accKind) {
       return MfmaInstrInfo{mDim, nDim, e.kDim, e.throughputCycles, aKind,
-                           cKind};
+                           accKind};
     }
   }
   return std::nullopt;
@@ -502,8 +525,12 @@ int selectMfmaNonKDim(const GemmProblem &prob, const TritonGemmConfig &cfg,
   int bestDim = 0;
   double bestThroughput = -1.0;
 
+  const ElemKind computeKind = mfmaComputeKind(prob.aDesc(), prob.bDesc());
+  const ElemKind accKind = mfmaAccumKind(computeKind);
   for (const auto &e : kMfmaThroughputTable) {
-    if (e.arch != hw.arch || e.aKind != mfmaComputeKind(prob.aDesc(), prob.bDesc()) || e.cKind != prob.cKind)
+    // Match on the MFMA accumulator kind, not the output store dtype (bf16/fp8
+    // outputs have no table rows) — see mfmaAccumKind.
+    if (e.arch != hw.arch || e.aKind != computeKind || e.cKind != accKind)
       continue;
     // Only consider square MFMA tiles (mDim == nDim).
     if (e.mDim != e.nDim)
