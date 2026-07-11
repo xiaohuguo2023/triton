@@ -1777,14 +1777,16 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // below memory, the tile is really memory-bound: apply the occupancy penalty
   // regardless of the de-rated isComputeBound flag. MX-scaled B only, so the
   // validated bf16/dense ranking (no MX scales on B) is untouched.
-  // Only in the SATURATED regime (enough tiles to fill all CUs): the low-occupancy
-  // latency-hiding penalty is physical only when the GPU is actually full. At
-  // decode / small-M (totalOutputTiles < numCUs) the GPU is under-filled — the
-  // bottleneck is under-utilization, not latency hiding — and applying this
-  // penalty there wrongly pushes the pick to over-narrow BN. Gate on saturation.
+  // Applies in BOTH prefill and decode. At decode (tiny sparse per-expert M,
+  // block_m=16) the tuned JSON consistently uses narrow BN64, but without this
+  // penalty the model rewards wide BN (fewer tiles) and picks BN128/256 — which
+  // e2e profiling shows is up to ~4x slower for the real sparse-routing decode
+  // GEMM. The low-occupancy memory penalty pushes the pick back to narrow BN,
+  // matching the JSON decode choice. (An earlier saturation gate here was removed:
+  // it had been calibrated to a uniform-routing microbench that wrongly flagged
+  // BN64 as slow; real sparse-decode timing + e2e profiling confirm narrow BN.)
   if (hasMxScales(prob.bDesc()) && occupancyPenalty == 1.0 &&
-      est.computeCycles < est.memoryCycles &&
-      est.totalOutputTiles >= hw.numCUs)
+      est.computeCycles < est.memoryCycles)
     occupancyPenalty = 1.0 / std::max(effectiveVgprOcc, 0.25);
 
   double totalCycles = est.effectiveTileCycles * est.numWaves * occupancyPenalty;
