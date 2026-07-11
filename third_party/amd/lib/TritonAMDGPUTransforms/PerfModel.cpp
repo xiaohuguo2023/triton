@@ -1800,6 +1800,23 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   if (hasMxScales(prob.bDesc()) && est.waveEfficiency > 0.0)
     totalCycles /= std::max(est.waveEfficiency, 0.5);
 
+  // Under-filled single-wave compute penalty (a8w4 grouped-MoE decode).
+  // A compute-ranked tile that fits in ONE wave but covers fewer output tiles
+  // than there are CUs only lights up (tiles/numCUs) of the machine — yet
+  // totalCycles charges it as a full wave. That lets wide BN (few tiles, 1 wave)
+  // wrongly out-rank narrow BN (more tiles, more waves, full CU fill) at decode,
+  // where profiling shows the wide pick is up to ~4x slower. Charge the idle CUs
+  // on the COMPUTE side (divide by the active-CU fraction). This is deliberately
+  // separate from the memory-side active-CU credit above (which helps prefill and
+  // is left untouched). Guards: MX-scaled B (a8w4) only, compute-ranked (the tile
+  // escaped the memory penalty), single wave, and genuinely under-filled.
+  if (hasMxScales(prob.bDesc()) && est.isComputeBound && est.numWaves <= 1 &&
+      hw.numCUs > 0 && est.totalOutputTiles < hw.numCUs) {
+    const double activeCuFrac =
+        static_cast<double>(est.totalOutputTiles) / hw.numCUs;
+    totalCycles /= std::max(activeCuFrac, 1e-3);
+  }
+
   double totalFlops = 2.0 * prob.M * prob.N * prob.K * prob.batchSize;
 
   // TFLOPS = totalFlops / (totalCycles / clockMHz * 1e6) / 1e12
