@@ -1,0 +1,14 @@
+# regenerable bulk artifacts — never commit
+*.gz
+*.picklog
+*.stdout
+*.server.log
+*.result.json
+*_result.txt
+*.log
+# experiment output dirs
+order_swap*/
+ab_*/
+gm_*/
+force_*/
+validate_*/
