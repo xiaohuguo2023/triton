@@ -14,6 +14,7 @@ import argparse, os, re, subprocess, sys
 
 THROTTLE_TEMP_C = 95  # approximate gfx950 throttle point
 TEMP_MARGIN_C = 10    # abort if within this margin
+UTIL_THRESHOLD_PCT = 10  # any GPU busier than this => machine contended
 
 
 def run(cmd):
@@ -22,6 +23,25 @@ def run(cmd):
         return r.returncode, r.stdout, r.stderr
     except Exception as e:
         return -1, "", str(e)
+
+
+def check_gpu_util():
+    """Utilization gate -- catches other users whose PIDs don't show in
+    --showpids (different container/namespace) but who still drive GPU%.
+    This is the check that caught the pollution --showpids missed."""
+    rc, out, _ = run(["rocm-smi", "--showuse"])
+    if rc != 0:
+        return True, "rocm-smi --showuse unavailable (skip)"
+    busy = []
+    for line in out.splitlines():
+        m = re.search(r"GPU\[(\d+)\].*?GPU use \(%\):\s*(\d+)", line)
+        if m:
+            g, u = int(m.group(1)), int(m.group(2))
+            if u > UTIL_THRESHOLD_PCT:
+                busy.append(f"GPU{g}={u}%")
+    if busy:
+        return False, f"GPUs busy: {', '.join(busy)}"
+    return True, f"all GPUs idle (<{UTIL_THRESHOLD_PCT}%)"
 
 
 def check_gpu_pids():
@@ -96,6 +116,7 @@ def check_users():
 
 
 CHECKS = [
+    ("GPU util",      check_gpu_util),
     ("GPU PIDs",      check_gpu_pids),
     ("GPU clocks",    check_clocks),
     ("GPU temp",      check_temp),
