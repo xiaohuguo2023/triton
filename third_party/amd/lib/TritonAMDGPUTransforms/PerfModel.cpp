@@ -1921,27 +1921,38 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
       return a.est.predictedTflops > b.est.predictedTflops;
     if (std::abs(a.est.arithmeticIntensity - b.est.arithmeticIntensity) > 1e-3)
       return a.est.arithmeticIntensity > b.est.arithmeticIntensity;
-    if (configs[a.idx].blockK != configs[b.idx].blockK)
-      return configs[a.idx].blockK > configs[b.idx].blockK;
-    // num_warps / num_stages tie-break — scaled-path aware.
+    // blockK / num_warps / num_stages tie-break — scaled-path aware.
     // For MX-scaled low-precision GEMMs (a8w4 / mxfp4 MoE) num_stages is not yet
     // a throughput term, so the real deeper-pipeline winners tie ns1 in
     // predictedTflops; the deeper pipeline hides the large per-stage LDS/dequant
     // latency, so among genuine ties prefer MORE num_stages, then FEWER
     // num_warps. Measured on gfx950: without this the deployed pick took ns1 on
-    // every bm128 a8w4 shape while the real winner was ns2. The bf16/dense path
-    // keeps its original ordering (num_warps larger, then num_stages smaller) —
-    // byte-identical, verified by the TensorAtlas config-pick gate.
+    // every bm128 a8w4 shape while the real winner was ns2. The MX ordering
+    // (blockK larger, then num_stages more, then num_warps fewer) is unchanged.
+    //
+    // DENSE (bf16/fp16) path: prefer MORE num_stages *before* blockK. On large
+    // dense GEMMs the cycle model ties BK64/ns2 with BK32/ns3 (same fill-fraction,
+    // pipelineOverlap and occupancy both saturated), but measured BK32/ns3 is
+    // +9..28% faster — deeper pipelining hides load latency and its smaller BK
+    // uses less LDS. The winner is COUPLED to a *smaller* blockK, so num_stages
+    // must precede the prefer-larger-blockK rule or the tie resolves to the slow
+    // BK64/ns2. Recovers the VERY_LARGE/MEDIUM regression vs autotune on the
+    // 471-shape TensorAtlas sweep; no winner-category regression (validated by
+    // Python re-rank + re-measure before this change).
     if (hasMxScales(prob.bDesc()) || hasMxScales(prob.aDesc())) {
+      if (configs[a.idx].blockK != configs[b.idx].blockK)
+        return configs[a.idx].blockK > configs[b.idx].blockK;
       if (configs[a.idx].numStages != configs[b.idx].numStages)
         return configs[a.idx].numStages > configs[b.idx].numStages;
       if (configs[a.idx].numWarps != configs[b.idx].numWarps)
         return configs[a.idx].numWarps < configs[b.idx].numWarps;
     } else {
+      if (configs[a.idx].numStages != configs[b.idx].numStages)
+        return configs[a.idx].numStages > configs[b.idx].numStages;
+      if (configs[a.idx].blockK != configs[b.idx].blockK)
+        return configs[a.idx].blockK > configs[b.idx].blockK;
       if (configs[a.idx].numWarps != configs[b.idx].numWarps)
         return configs[a.idx].numWarps > configs[b.idx].numWarps;
-      if (configs[a.idx].numStages != configs[b.idx].numStages)
-        return configs[a.idx].numStages < configs[b.idx].numStages;
     }
     {
       const auto &ca = configs[a.idx];
