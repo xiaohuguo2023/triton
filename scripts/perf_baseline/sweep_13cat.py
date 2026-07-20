@@ -11,10 +11,12 @@ import triton
 import io, contextlib
 spec = importlib.util.spec_from_file_location("tut03", TUTORIAL)
 tut = importlib.util.module_from_spec(spec)
-with contextlib.redirect_stdout(io.StringIO()):
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
     try:
         spec.loader.exec_module(tut)
-    except SystemExit:
+    except BaseException:
+        # tutorial's top-level benchmark.run() may fail without matplotlib; we
+        # only need its matmul defs (defined earlier). See sweep.py for details.
         pass
 
 sys.path.insert(0, str(Path(__file__).parent))

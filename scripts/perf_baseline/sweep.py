@@ -29,11 +29,17 @@ import io, contextlib
 spec = importlib.util.spec_from_file_location("tut03", TUTORIAL)
 tut = importlib.util.module_from_spec(spec)
 # Patch out the tutorial's auto-run benchmark by redirecting stdout during import.
-with contextlib.redirect_stdout(io.StringIO()):
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
     try:
         spec.loader.exec_module(tut)
-    except SystemExit:
+    except BaseException:
+        # The tutorial's top-level benchmark.run() may fail on a lean serving
+        # container (e.g. matplotlib not installed). We only need its matmul /
+        # matmul_kernel_amd / matmul_model definitions, which are defined before
+        # that call, so swallow the failure and validate the symbols below.
         pass
+assert hasattr(tut, "matmul") and hasattr(tut, "matmul_kernel_amd"), \
+    "tutorial module missing matmul/matmul_kernel_amd after import"
 
 sys.path.insert(0, str(Path(__file__).parent))
 from shapes import ALL_SHAPES
