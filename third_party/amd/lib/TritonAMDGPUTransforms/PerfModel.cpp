@@ -1658,8 +1658,37 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   //   efficiency = kPeakMfmaEff * min(1, min(BM,BN)/128)
   constexpr double kPeakMfmaEff = 0.40; // achievable/theoretical MFMA ceiling
   const int minTileDim = std::min(cfg.blockM, cfg.blockN);
-  const double mfmaEfficiency =
+  double mfmaEfficiency =
       kPeakMfmaEff * std::min(1.0, static_cast<double>(minTileDim) / 128.0);
+
+  // Dense large-tile MFMA efficiency (physics: operand reuse + accumulator
+  // latency-hiding). The min-dim de-rate above saturates at 128, so it treats
+  // 128x128 / 128x256 / 256x256 as equally efficient (0.40). Measured on gfx950
+  // in the clean-wave regime (M=N=16384, so wave-quantization tail is
+  // negligible), the realized fraction of MFMA peak instead rises strongly with
+  // BOTH tile dims and saturates:
+  //     frac_of_peak ~= 2.07 * (BM/(BM+108)) * (BN/(BN+108))   (SSE 0.017 over
+  //     BM,BN in 64..256; e.g. 128x128 0.62, 128x256 0.85, 256x256 1.00).
+  // Each dimension amortizes operand loads and adds independent MFMA accumulator
+  // chains that hide the MFMA pipeline latency, with diminishing returns
+  // (half-saturation ~108). Apply as a boost NORMALIZED to the 128x128 baseline
+  // and CLAMPED >= 1: it only lifts tiles larger than 128x128 and never lowers
+  // the already-validated small/narrow-tile efficiency, so LARGE_K / skinny /
+  // small-M picks (small tiles -> factor 1) are untouched and the wave/tile-count
+  // penalties still bound coarse tilings. Dense (bf16/fp16) only; a8w4 keeps its
+  // own de-rate. This closes the MEDIUM regression where the winner is always a
+  // BN256 tile the saturated de-rate wrongly tied with 128x128.
+  if (!hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc())) {
+    constexpr double kAmortHalf = 108.0;
+    constexpr double kBaseDim = 128.0;
+    const double base = (kBaseDim / (kBaseDim + kAmortHalf)) *
+                        (kBaseDim / (kBaseDim + kAmortHalf));
+    const double bmd = static_cast<double>(cfg.blockM);
+    const double bnd = static_cast<double>(cfg.blockN);
+    const double largeTile =
+        (bmd / (bmd + kAmortHalf)) * (bnd / (bnd + kAmortHalf)) / base;
+    mfmaEfficiency *= std::max(1.0, largeTile);
+  }
 
   // Realized compute roofline: theoretical MFMA cycles inflated by the
   // lane-utilization waste (1/mfmaUtil) and the realized-efficiency de-rate.
