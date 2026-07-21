@@ -1825,6 +1825,30 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
       est.computeCycles < est.memoryCycles)
     occupancyPenalty = 1.0 / std::max(effectiveVgprOcc, 0.25);
 
+  // Dense tiny-M / N-dominant relaxation (LARGE_N regime). On a tiny-M, huge-N
+  // problem the winning tile is small-BM × WIDE-BN (matches the shape: minimal
+  // M-padding, efficient N). The model instead ranks the tiny SQUARE (e.g.
+  // 32x32) #1 because it "fills" the machine (768 padded tiles, 3 full waves,
+  // compute-bound → no penalty) while the wide-BN tile under-fills (192 tiles,
+  // 1 wave) and is classified memory-bound → hit with the 1/occ penalty. That
+  // fill is fake: M=4 padded into 32-row tiles is 8x wasted work. The wide-BN
+  // tile's low per-CU occupancy is an artifact of the padded tiny M (blockM≫M),
+  // not a latency-hiding deficit — the huge N supplies plenty of tiles to keep
+  // HBM busy, so it is bandwidth-bound on N, not occupancy-bound. Drop the
+  // low-occupancy penalty in this regime. Measured (4x24576x1536): 16x128 is
+  // 1.4x faster than the model's compute-bound pick 32x32; the oracle wide-BN
+  // config sits at PM rank #40-54 purely because of this penalty.
+  // Dense (bf16/fp16) ONLY — a8w4 decode is tiny-M too but genuinely wants
+  // narrow BN (sparse routing), and its penalty above (hasMxScales branch) is
+  // load-bearing; !hasMxScales keeps that path byte-identical. Gated tightly:
+  // padded M (blockM > M), N-dominant (N ≥ 8·M), and a wide-BN tile
+  // (blockN ≥ 2·blockM) so square/narrow tiles are unaffected.
+  if (!hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc()) &&
+      !est.isComputeBound && occupancyPenalty > 1.0 &&
+      cfg.blockM > prob.M && prob.N >= 8 * prob.M &&
+      cfg.blockN >= 2 * cfg.blockM)
+    occupancyPenalty = 1.0;
+
   double totalCycles = est.effectiveTileCycles * est.numWaves * occupancyPenalty;
   // Charge the partial last wave: with numWaves scheduling waves, the final wave
   // occupies only waveEfficiency of the CUs, so the tiles-per-CU (and thus the
