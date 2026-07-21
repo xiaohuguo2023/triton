@@ -1753,9 +1753,19 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   double mfmaLatencyStall = 1.0;
   if (!hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc()) &&
       est.wavesPerSimd > 0) {
-    constexpr double kMfmaLatencyWaves = 0.4;
-    mfmaLatencyStall =
-        1.0 + kMfmaLatencyWaves / static_cast<double>(est.wavesPerSimd);
+    // MFMA latency is hidden by independent MFMA groups in flight, which come
+    // from BOTH resident waves per SIMD AND the software-pipeline depth: each of
+    // the (numStages-1) staged k-iterations issues an independent MFMA group.
+    // So the hiding parallelism is wavesPerSimd × pipelineDepth. This is the
+    // single mechanism behind two effects: W8>W4 (more waves) AND ns3>ns2 on
+    // compute-bound tiles (deeper pipeline = more MFMAs in flight, e.g.
+    // 8192x2112x7168 256x256: ns3 794 vs ns2 617). k≈1.2 recalibrated so the
+    // ns3 wave-curve (W4/W8 = 1 vs 2 waves × depth 2) still matches the measured
+    // +23% (was k=0.4 against wavesPerSimd alone).
+    constexpr double kMfmaLatencyWaves = 1.2;
+    const double hiding = static_cast<double>(est.wavesPerSimd) *
+                          std::max(1.0, effectivePipelineDepth);
+    mfmaLatencyStall = 1.0 + kMfmaLatencyWaves / hiding;
   }
   const double inflatedComputeCycles =
       est.computeCycles / (mfmaUtil * std::max(mfmaEfficiency, 0.05)) *
