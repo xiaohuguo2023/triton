@@ -1661,6 +1661,16 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   double mfmaEfficiency =
       kPeakMfmaEff * std::min(1.0, static_cast<double>(minTileDim) / 128.0);
 
+  // Clean-wave realized MFMA efficiency relative to the 128x128 baseline
+  // (measured at M=N=16384, SSE 0.0025; BN-weighted -- the N-tile matters more).
+  // >1 for tiles larger than 128x128, <1 for smaller.
+  auto cleanWaveRel = [](double bm, double bn) {
+    constexpr double aM = 76.0, aN = 156.0;
+    constexpr double kBaseM = 128.0 / (128.0 + aM);
+    constexpr double kBaseN = 128.0 / (128.0 + aN);
+    return ((bm / (bm + aM)) * (bn / (bn + aN))) / (kBaseM * kBaseN);
+  };
+
   // Dense large-tile MFMA-efficiency credit (GATED, asymmetric, capped).
   // The min-dim de-rate saturates at 128, so 128x128 / 128x256 / 256x256 tie at
   // 0.40 -- but clean-wave (M=N=16384) measurement shows realized efficiency
@@ -1686,15 +1696,29 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   if (!hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc()) &&
       hw.numCUs > 0 && est.totalOutputTiles >= hw.numCUs &&
       prob.N >= cfg.blockN && prob.M >= cfg.blockM) {
-    constexpr double aM = 76.0, aN = 156.0;
-    constexpr double kBaseM = 128.0 / (128.0 + aM);
-    constexpr double kBaseN = 128.0 / (128.0 + aN);
-    const double bmd = static_cast<double>(cfg.blockM);
-    const double bnd = static_cast<double>(cfg.blockN);
-    double largeTile =
-        ((bmd / (bmd + aM)) * (bnd / (bnd + aN))) / (kBaseM * kBaseN);
+    double largeTile = cleanWaveRel(cfg.blockM, cfg.blockN);
     largeTile = std::min(std::max(largeTile, 1.0), 1.61); // [1, 256x256 peak]
     mfmaEfficiency *= largeTile;
+  }
+
+  // Small-tile de-rate correction. The min-dim de-rate (0.40 * minTileDim/128)
+  // is too LENIENT for tiny tiles: a 32x32 tile gets 0.10 but its measured
+  // clean-wave efficiency is ~0.07 (cleanWaveRel(32,32)=0.18 of the 128x128
+  // baseline). The model then over-predicts a machine-FILLING tiny square and
+  // ranks it above the wide-BN tile that actually wins -- measured 64x36864x7168
+  // (LARGE_NK, K=16384): PM top-1'd BM32BN32 at 0.41x autotune vs oracle
+  // BM128BN256 1.20x; and 4x24576x1536 (LARGE_N, K=1536): BM32BN32 over the
+  // faster BM16BN128. Replace the lenient de-rate on sub-128 tiles with the
+  // measured clean-wave efficiency (PENALTY only -- min(), never a boost). This
+  // is the symmetric partner of the large-tile credit above (which is fill-gated
+  // because a large tile can waste CUs when it under-fills; a small tile never
+  // does, so the penalty needs no gate). Because the de-rate only enters the
+  // COMPUTE roofline, memory-bound small-tile picks (correct on skinny / tiny-K)
+  // are unaffected -- only over-predicted COMPUTE-bound tinies move. Dense only.
+  if (!hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc()) &&
+      minTileDim < 128) {
+    double rel = std::min(cleanWaveRel(cfg.blockM, cfg.blockN), 1.0);
+    mfmaEfficiency = std::min(mfmaEfficiency, kPeakMfmaEff * rel);
   }
 
   // Realized compute roofline: theoretical MFMA cycles inflated by the
@@ -1792,17 +1816,46 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // resident) over large tiles (fewer but with the same effective HBM
   // saturation), even when the larger tile has much lower per-output HBM traffic.
   //
-  // This is upstream's STEP penalty, kept as-is: compute-bound tiles pay no
-  // penalty (MFMA saturated); memory-bound tiles are divided by the (saturation-
-  // capped) VGPR occupancy. Note isComputeBound is now evaluated against the
-  // DE-RATED compute roofline (inflatedComputeCycles), so the realized-efficiency
-  // and Little's-law memory terms — not this switch — carry the fine-grained
-  // ranking; the step here only applies the coarse low-occupancy memory penalty.
+  // Low-occupancy memory penalty. The physical mechanism is HBM-bandwidth
+  // SATURATION, not raw wave count: sustained DRAM BW = outstanding bytes /
+  // round-trip latency (Little's law). Outstanding bytes on a CU =
+  //   residentCTAs × pipelineDepth × (DRAM bytes per K-iter per CTA).
+  // A wide-BN or deep-staged tile keeps HBM busy with FEW resident CTAs; a
+  // narrow tile needs many. The old `1/vgprOccupancy` (kept for the MX/a8w4
+  // path below) counted only CTAs and threw away bytes-per-CTA, so it wrongly
+  // charged a 2x penalty to low-occupancy WIDE tiles that already saturate HBM
+  // — e.g. LARGE_N 16x128 (tiny-M) and LARGE_NK BM128xBN256 (deep-K), both of
+  // which measure FASTER than the machine-filling narrow/tiny tile the penalty
+  // steered the model toward. Little's law gives penalty 1.0 for those (verified
+  // outstanding ~66 KB ≫ the ~13 KB needed to saturate) while still penalizing
+  // genuinely starved tiles (few CTAs AND small per-CTA loads). This subsumes
+  // the previous ad-hoc "tiny-M / N-dominant" occupancy relaxation.
   const double saturationOccupancy =
       4.0 / std::max(hw.maxWavesPerSimd, 1);
   const double effectiveVgprOcc = std::min(vgprOccupancy, saturationOccupancy);
-  double occupancyPenalty =
-      est.isComputeBound ? 1.0 : (1.0 / std::max(effectiveVgprOcc, 0.25));
+  const bool dense =
+      !hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc());
+  double occupancyPenalty;
+  if (!dense) {
+    // MX/a8w4: keep the VGPR-occupancy step penalty (load-bearing for sparse
+    // decode narrow-BN selection; validated e2e). The MX correction below also
+    // relies on this formulation.
+    occupancyPenalty =
+        est.isComputeBound ? 1.0 : (1.0 / std::max(effectiveVgprOcc, 0.25));
+  } else if (est.isComputeBound) {
+    occupancyPenalty = 1.0; // MFMA-saturated: occupancy irrelevant.
+  } else {
+    const double dramBytesPerIter = tileBytesABperK * (1.0 - l2HitRate);
+    const double depth = std::max(1.0, effectivePipelineDepth);
+    const double residentCTAs =
+        std::max(1.0, static_cast<double>(est.ctasPerCU));
+    const double outstanding = residentCTAs * depth * dramBytesPerIter;
+    const double achieved =
+        std::min(dramBwPerCU, outstanding / hbmLatencyCycles);
+    // penalty = peak / achieved (>=1), capped at the old 1/0.25 = 4x floor.
+    occupancyPenalty =
+        (achieved > 0.0) ? std::min(dramBwPerCU / achieved, 4.0) : 1.0;
+  }
 
   // a8w4 correction: the compute de-rate inflates compute for tall block_m=16
   // tiles (the minTileDim/128 efficiency factor), which can mis-classify a
@@ -1824,30 +1877,6 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   if (hasMxScales(prob.bDesc()) && occupancyPenalty == 1.0 &&
       est.computeCycles < est.memoryCycles)
     occupancyPenalty = 1.0 / std::max(effectiveVgprOcc, 0.25);
-
-  // Dense tiny-M / N-dominant relaxation (LARGE_N regime). On a tiny-M, huge-N
-  // problem the winning tile is small-BM × WIDE-BN (matches the shape: minimal
-  // M-padding, efficient N). The model instead ranks the tiny SQUARE (e.g.
-  // 32x32) #1 because it "fills" the machine (768 padded tiles, 3 full waves,
-  // compute-bound → no penalty) while the wide-BN tile under-fills (192 tiles,
-  // 1 wave) and is classified memory-bound → hit with the 1/occ penalty. That
-  // fill is fake: M=4 padded into 32-row tiles is 8x wasted work. The wide-BN
-  // tile's low per-CU occupancy is an artifact of the padded tiny M (blockM≫M),
-  // not a latency-hiding deficit — the huge N supplies plenty of tiles to keep
-  // HBM busy, so it is bandwidth-bound on N, not occupancy-bound. Drop the
-  // low-occupancy penalty in this regime. Measured (4x24576x1536): 16x128 is
-  // 1.4x faster than the model's compute-bound pick 32x32; the oracle wide-BN
-  // config sits at PM rank #40-54 purely because of this penalty.
-  // Dense (bf16/fp16) ONLY — a8w4 decode is tiny-M too but genuinely wants
-  // narrow BN (sparse routing), and its penalty above (hasMxScales branch) is
-  // load-bearing; !hasMxScales keeps that path byte-identical. Gated tightly:
-  // padded M (blockM > M), N-dominant (N ≥ 8·M), and a wide-BN tile
-  // (blockN ≥ 2·blockM) so square/narrow tiles are unaffected.
-  if (!hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc()) &&
-      !est.isComputeBound && occupancyPenalty > 1.0 &&
-      cfg.blockM > prob.M && prob.N >= 8 * prob.M &&
-      cfg.blockN >= 2 * cfg.blockM)
-    occupancyPenalty = 1.0;
 
   double totalCycles = est.effectiveTileCycles * est.numWaves * occupancyPenalty;
   // Charge the partial last wave: with numWaves scheduling waves, the final wave
