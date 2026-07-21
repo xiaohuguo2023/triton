@@ -32,7 +32,7 @@ WITHOUT = {
 ORDER = sorted(WITHOUT, key=lambda c: WITHOUT[c][0])
 
 
-def gpu_busy():
+def _busy_once():
     try:
         out = subprocess.run(["rocm-smi", "--showuse"], capture_output=True,
                              text=True, timeout=10).stdout
@@ -44,6 +44,17 @@ def gpu_busy():
         if m and int(m.group(2)) > 10:
             busy.append(f"GPU{m.group(1)}={m.group(2)}%")
     return busy
+
+
+def gpu_busy():
+    """Require TWO consecutive busy samples so a transient spike doesn't abort
+    the whole sweep. Returns the second sample's busy list (empty = clean)."""
+    b1 = _busy_once()
+    if not b1:
+        return b1
+    import time as _t
+    _t.sleep(3)
+    return _busy_once()
 
 
 def geo(xs):

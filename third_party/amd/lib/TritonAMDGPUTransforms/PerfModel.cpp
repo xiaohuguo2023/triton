@@ -1658,8 +1658,44 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   //   efficiency = kPeakMfmaEff * min(1, min(BM,BN)/128)
   constexpr double kPeakMfmaEff = 0.40; // achievable/theoretical MFMA ceiling
   const int minTileDim = std::min(cfg.blockM, cfg.blockN);
-  const double mfmaEfficiency =
+  double mfmaEfficiency =
       kPeakMfmaEff * std::min(1.0, static_cast<double>(minTileDim) / 128.0);
+
+  // Dense large-tile MFMA-efficiency credit (GATED, asymmetric, capped).
+  // The min-dim de-rate saturates at 128, so 128x128 / 128x256 / 256x256 tie at
+  // 0.40 -- but clean-wave (M=N=16384) measurement shows realized efficiency
+  // rises with tile size and is BN-weighted:
+  //     frac_of_peak ~= 2.14 * (BM/(BM+76)) * (BN/(BN+156))   (SSE 0.0025)
+  // (operand reuse + MFMA accumulator latency-hiding; the N-tile matters more).
+  //
+  // GATE (the key finding of the tile-family ground truth, 47 shapes/13 cats):
+  // the large tile only wins when it still FILLS the machine -- best tile is
+  // BN256 for 17/17 shapes with >=1 full wave, but a NARROW tile for 23/29
+  // single-partial-wave shapes (skinny / small / LARGE_K / small-M LARGE_NK).
+  // So credit ONLY when this candidate covers >= numCUs tiles (>=1 full wave).
+  // A prior UNconditional boost regressed 11/13 categories by over-picking large
+  // tiles on under-filled shapes; the gate is what prevents that.
+  // Normalized to the 128x128 baseline, clamped to [1, peak] so it only lifts
+  // large well-filled tiles and never exceeds the measured 256x256 realized
+  // efficiency (~0.64). Dense (bf16/fp16) only; a8w4 keeps its own de-rate.
+  // Padding guard: don't credit a tile wider/taller than the problem itself
+  // (e.g. BN256 on N=128 wastes half its columns). Require prob dims >= tile
+  // dims so the credited tile is genuinely utilized, not padded. Fixes the
+  // LARGE_M / skinny residual where the fill-gate alone (many M-tiles) let a
+  // padded wide BN through.
+  if (!hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc()) &&
+      hw.numCUs > 0 && est.totalOutputTiles >= hw.numCUs &&
+      prob.N >= cfg.blockN && prob.M >= cfg.blockM) {
+    constexpr double aM = 76.0, aN = 156.0;
+    constexpr double kBaseM = 128.0 / (128.0 + aM);
+    constexpr double kBaseN = 128.0 / (128.0 + aN);
+    const double bmd = static_cast<double>(cfg.blockM);
+    const double bnd = static_cast<double>(cfg.blockN);
+    double largeTile =
+        ((bmd / (bmd + aM)) * (bnd / (bnd + aN))) / (kBaseM * kBaseN);
+    largeTile = std::min(std::max(largeTile, 1.0), 1.61); // [1, 256x256 peak]
+    mfmaEfficiency *= largeTile;
+  }
 
   // Realized compute roofline: theoretical MFMA cycles inflated by the
   // lane-utilization waste (1/mfmaUtil) and the realized-efficiency de-rate.
