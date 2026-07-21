@@ -1731,8 +1731,35 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // only stall was tried and is insufficient: bf16 256x256 and fp4 BN512 both
   // sit at 1 CTA/CU but have opposite real outcomes — the differentiator is
   // compute-work-per-wave vs latency, i.e. the issue_interval, not occupancy.)
+  // MFMA pipeline latency-hiding stall (dense; the fp4-residency TODO above,
+  // now realized for bf16/fp16). A dependent MFMA accumulation chain cannot
+  // issue back-to-back: each MFMA has a fixed latency before its accumulator is
+  // ready, so the SIMD stalls unless OTHER resident waves fill the gap. The
+  // unhidden fraction shrinks with resident waves per SIMD (est.wavesPerSimd),
+  // giving the compute-pipeline analogue of Little's law:
+  //     stall = 1 + kMfmaLatencyWaves / wavesPerSimd
+  // This is what physically RANKS num_warps (and, via VGPR pressure, spills):
+  // num_warps enters through wavesPerSimd = min(maxWaves, vgprPerSimd/vgprPerWarp)
+  // — more warps split the accumulator so each warp uses fewer VGPRs and MORE
+  // waves fit per SIMD. On a large tile where only 1 CTA fits, nw=4 gives 1
+  // wave/SIMD (stall ~1.4x) while nw=8 gives 2 (stall ~1.2x) → nw=8 wins
+  // (measured 8192x2112x7168 256x256: W8 794 vs W4 644 = 1.23x); a spilling
+  // high-VGPR config drops to 1 wave and is likewise penalized. On small tiles
+  // many waves already fit so the term → 1 and nw saturates (no spurious nw=8).
+  // k≈0.4 calibrated from the measured wave curve (1→2 waves = +16%, 2→4 = +5%,
+  // 4→6 ≈ 0). Applied only to the compute roofline (like mfmaUtil), NOT the
+  // baseline computeCycles used for pipeline overlap. Dense only; MX/a8w4 keeps
+  // its own (still-deferred) residency handling.
+  double mfmaLatencyStall = 1.0;
+  if (!hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc()) &&
+      est.wavesPerSimd > 0) {
+    constexpr double kMfmaLatencyWaves = 0.4;
+    mfmaLatencyStall =
+        1.0 + kMfmaLatencyWaves / static_cast<double>(est.wavesPerSimd);
+  }
   const double inflatedComputeCycles =
-      est.computeCycles / (mfmaUtil * std::max(mfmaEfficiency, 0.05));
+      est.computeCycles / (mfmaUtil * std::max(mfmaEfficiency, 0.05)) *
+      mfmaLatencyStall;
   const double maxCycles = std::max({inflatedComputeCycles, est.memoryCycles,
                                        est.ldsCycles});
   if (hasMxScales(prob.bDesc())) {
