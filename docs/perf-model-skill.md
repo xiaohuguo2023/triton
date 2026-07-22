@@ -26,6 +26,13 @@ The AMD PerfModel is an **analytical GEMM performance model** for AMD GPUs that 
 
 Selection overhead: **0.09 ms** (vs autotuning which benchmarks N configs × ~25ms each).
 
+**Update (2026-07) — direct vs-autotune sweep (gfx950, 471 fp16 shapes).** After
+the saturation-physics rewrite, PerfModel's top-1 pick beats Triton autotune on
+**97% of shapes, geomean ~1.44×** (up from 83%). The cost model now derives
+block-K, num_warps, num_stages, and occupancy from Little's-law saturation +
+clean-wave MFMA efficiency rather than tie-breaks. Full explainer + per-category
+table: [`perf-model-saturation-physics.md`](perf-model-saturation-physics.md).
+
 ---
 
 ## Shape Categorization
@@ -230,6 +237,19 @@ int  gsm        = selectGroupSizeM(prob, ranked[0], hw); // GROUP_SIZE_M
 ---
 
 ## Known Gaps and Next Steps
+
+> **Update (2026-07).** Gaps 1 and 2 below are substantially addressed by the
+> saturation-physics rewrite — see
+> [`perf-model-saturation-physics.md`](perf-model-saturation-physics.md).
+> **Gap 1 (block-K):** block-K is now non-invariant because `memoryCycles` uses
+> *achieved* DRAM BW (Little's law): deep-K shapes correctly prefer larger BK
+> (LARGE_MK 83%→100% win). The M=1536 *shallow-K* case (which wants *smaller* BK)
+> is the opposite regime and remains a minor residual — the preference is
+> genuinely non-monotonic, and the shape still beats autotune.
+> **Gap 2 (multi-wave memory overlap):** implemented exactly as proposed —
+> `outstanding = ctasPerCU × pipelineDepth × dramBytesPerKIter`, so multi-wave
+> tiles that saturate HBM are no longer over-penalized (fixes the tiny-M / wide-BN
+> and `128×64`-vs-`256×256` mis-picks; LARGE_N 71%→100% win).
 
 ### Gap 1: M=1536/1664 — BK=128 vs BK=64 (-14 to -16%)
 

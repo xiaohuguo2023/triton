@@ -274,6 +274,15 @@ because square tiles usually win on raw compute density.
 
 ## Calibration Constants (gfx950)
 
+> **⚠️ SUPERSEDED (2026-07).** The constants in this block (`stallAmp`,
+> `perKIterOverheadCycles=350`, `BK<64 ×1.30`, `perTileOverheadCycles`) belong to
+> the earlier model era and are NOT in the current code. The shipped gfx950
+> constants are in the "Current calibration constants" section of
+> [`perf-model-saturation-physics.md`](perf-model-saturation-physics.md)
+> (`kPeakMfmaEff=0.40`, `cleanWaveRel` aM=76/aN=156, `hbmLatencyCycles=2000`,
+> `kMfmaLatencyWaves=1.2`, occupancy = Little's-law HBM saturation). Keep the block
+> below only as historical record of how the model looked pre-2026-07.
+
 After all the above:
 
 ```cpp
