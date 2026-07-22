@@ -207,7 +207,7 @@ These have come up in discussion but don't have task IDs yet:
 
 Re-derived GEMM tile selection from physical laws (Little's-law bytes-in-flight +
 clean-wave MFMA efficiency), replacing per-axis tie-break heuristics. Overall
-fp16 win rate vs Triton autotune **83% → 93%**, geomean ~1.44× (profiler device-time). Full explainer:
+fp16 win rate vs Triton autotune **83% → 95%**, geomean ~1.44× (profiler device-time). Full explainer:
 [`perf-model-saturation-physics.md`](perf-model-saturation-physics.md).
 
 - ✅ Clean-wave MFMA-efficiency credit/de-rate (`cleanWaveRel`) — fixes MEDIUM
@@ -226,9 +226,12 @@ fp16 win rate vs Triton autotune **83% → 93%**, geomean ~1.44× (profiler devi
   `a772fe00`. More honest baseline (device-time excludes CPU launch overhead that
   inflated microsecond kernels) and it **uncovered two real losses** event timing
   had hidden: `LARGE_M_SKINNY` (0.91) and `LARGE_N_SKINNY` (0.93) — tiny-K skinny
-  shapes, PM kernel ~8% slower than autotune. Corrected overall: geomean ~1.44×,
-  win **83% → 93%** (the earlier 97% was event-inflated). Open residual: debug
-  the 6 skinny shapes.
+  shapes, PM kernel ~8% slower than autotune. (The earlier 97% was event-inflated.)
+- ✅ Tiny-K (BK>K) fix: charge the masked block + cap saturation depth at
+  numKIter. `8ffb762b`. Fixes the two skinny losses the profiler uncovered
+  (0.91→1.07, 0.93→1.06), SMALL→1.19, LARGE_NK +0.004. Fires only when BK≥K
+  (K≥256 shapes byte-identical). **Corrected overall: geomean ~1.44×, win 95%.**
+  See Insight 5 in `perf-model-saturation-physics.md`.
 
 ## Process
 

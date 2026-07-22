@@ -371,7 +371,7 @@ vision without over-committing:
 - [x] **Cost-model accuracy (2026-07): saturation-physics rewrite.** The roofline
       now derives block-K, num_warps, num_stages, and occupancy from Little's-law
       bytes-in-flight + clean-wave MFMA efficiency (not tie-breaks). Config-
-      selection accuracy on a 471-shape fp16 sweep: **83% → 93% win vs Triton
+      selection accuracy on a 471-shape fp16 sweep: **83% → 95% win vs Triton
       autotune, geomean ~1.44×.** See
       [`perf-model-saturation-physics.md`](perf-model-saturation-physics.md).
 - [ ] Priority 3: integration regression tests (BlockPingpong, LowerLoops)

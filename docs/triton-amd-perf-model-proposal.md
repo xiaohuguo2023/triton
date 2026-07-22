@@ -392,7 +392,7 @@ predictedTflops = 2×M×N×K×batch / (totalCycles / clockMHz×1e6) / 1e12
 >   tiles, penalty for small), fixing large-vs-small tile selection.
 >
 > All four are dense (bf16/fp16) only; the a8w4/MX path is byte-identical. Measured
-> result: **93% win vs Triton autotune on a 471-shape fp16 suite, geomean ~1.44×.**
+> result: **95% win vs Triton autotune on a 471-shape fp16 suite, geomean ~1.44×.**
 
 ### 4.5 MFMA Instruction Size Selection
 
@@ -866,7 +866,7 @@ burden of callers having to manually mirror attribute-read logic that already
 exists in `AccelerateAMDMatmul.cpp`.
 
 **Measured config-selection accuracy (gfx950, 2026-07).** On a 471-shape fp16
-suite, PerfModel's top-1 pick beats Triton's own autotuner on **93% of shapes**
+suite, PerfModel's top-1 pick beats Triton's own autotuner on **95% of shapes**
 (geomean **~1.44×**), up from 83% before the saturation-physics work — with
 selection overhead ~0.1 ms vs autotuning's N×~25 ms benchmark trials. See
 [`perf-model-saturation-physics.md`](perf-model-saturation-physics.md).

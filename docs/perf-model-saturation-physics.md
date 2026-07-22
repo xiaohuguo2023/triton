@@ -74,7 +74,7 @@ some arbitrary tie-break picks the winner — often the wrong one:
 
 The whole 2026-07 effort was: **replace those ties + tie-breaks with real
 physics.** Result on our 471-shape fp16 test suite: **win rate vs Triton's own
-autotuner went 83% → 93%, geomean speedup ~1.44×.**
+autotuner went 83% → 95%, geomean speedup ~1.44×.**
 
 ### How we measure (so numbers are trustworthy)
 For each shape we run PerfModel's top pick AND Triton autotune's pick and report
@@ -104,7 +104,9 @@ lot for small kernels):**
 > kernel launch against autotune's *wrapper* (unfair CPU overhead) and measured
 > wall-clock (launch overhead), inflating PM to a fake 1.5×. **Lesson: for
 > microsecond kernels, only device-time is trustworthy; wall-clock lies.** These
-> 6 skinny shapes are a genuine open residual (see Part 6).
+> 6 skinny shapes were then a real regression — **now fixed** (Insight 5): the
+> better measurement revealed a genuine model bug in the block-K term, which we
+> could only see *because* we finally measured correctly.
 
 ---
 
@@ -380,6 +382,41 @@ consistent: block-K, num_stages, occupancy, and num_warps all flow from
 
 ---
 
+### Insight 5 — Tiny-K (BK > K): charge the masked block
+
+**Symptom.** Once we could measure microsecond kernels correctly (profiler +
+interleaved + IQR — see the ⚠️ box above), the tiny-K skinny categories showed up
+as **real losses**: `LARGE_M_SKINNY` 0.91, `LARGE_N_SKINNY` 0.93 (K=32/64, 0% win).
+A profiler config sweep showed PM picked **BK256/BK512** where the measured winner
+is **BK64/BK32**.
+
+**Two coupled bugs, both when `BK > K`** (the block is bigger than the whole
+reduction, e.g. K=64 with BK=256 → `numKIter = K/BK = 0.25`):
+
+1. *Saturation over-credit* (in Insight 4's Little's-law term). For BK>K the loop
+   runs ONE masked iteration streaming only K (not BK) elements, but the term used
+   `depth × (BM+BN)·BK·2` outstanding bytes — 4× too many for K=64/BK=256 — so it
+   declared BK256 bandwidth-saturated and fast. **Fix:** cap the effective depth at
+   the iterations that actually exist — `depth = min(numStages-1, numKIter)` — so
+   outstanding never exceeds the total traffic.
+
+2. *Compute under-charge.* `numKIter = K/BK` is *exact*, so BK256 on K=64 was
+   charged 0.25 iterations = only BK64-worth of MFMAs. But the kernel runs one
+   FULL masked BK256 block — the MFMAs execute over the padded BK (K/BK useful),
+   ~4× the work. **Fix:** floor `numKIter` at 1 for `computeCycles`, so BK>K pays
+   for the masked block it actually runs.
+
+Both guards fire **only when `BK ≥ K`** (tiny-K tiles); every `K ≥ 256` shape is
+byte-identical. Together they make the model correctly prefer BK64/BK32 for K=32/64.
+
+**Result.** `LARGE_M_SKINNY` 0.91 → 1.07, `LARGE_N_SKINNY` 0.93 → 1.06 (both now
+win), `SMALL` → 1.19 (100%), and even `LARGE_NK` +0.004 (its K=128 members now
+prefer BK128 over a wasteful BK256). Overall win 93% → **95%**. Residual: the
+skinny 67% win is a warps/ns tie-break *within* the now-correct BK — a smaller,
+separate axis.
+
+---
+
 ## Part 3 — The calibration constants (2026-07)
 
 These are the only tuned numbers, and each is grounded in a measurement:
@@ -432,14 +469,14 @@ tiny-shape rows).
 | LARGE_MN | 13 | 1.12 | 100% | (stable) |
 | SMALL | 6 | 1.13 | 83% | (mostly ties/wins) |
 | LARGE_K_SKINNY | 3 | 2.07 | 100% | Insight 4 |
-| **LARGE_M_SKINNY** | 3 | **0.91** | **0%** | **real loss — open residual** |
-| **LARGE_N_SKINNY** | 3 | **0.93** | **0%** | **real loss — open residual** |
+| LARGE_M_SKINNY | 3 | 1.07 | 67% | fixed (Insight 5) |
+| LARGE_N_SKINNY | 3 | 1.06 | 67% | fixed (Insight 5) |
 | LARGE_M | 2 | 1.41 | 100% | |
-| **overall (n-weighted)** | **471** | **~1.44** | **93%** | |
+| **overall (n-weighted)** | **471** | **~1.44** | **95%** | |
 
 (Before this work, overall win rate was ~83% with MEDIUM/VERY_LARGE tie-break
 *regressions*. The 97% figure quoted in earlier drafts was event-timing-inflated;
-93% is the device-time truth.)
+95% is the device-time truth, after the tiny-K fix in Insight 5.)
 
 For reference, before this work overall win rate was **83%**, and MEDIUM /
 VERY_LARGE had tie-break *regressions*.
@@ -482,13 +519,10 @@ category.
 
 Not everything is perfect; these are known:
 
-0. **LARGE_M_SKINNY (0.91) and LARGE_N_SKINNY (0.93) — REAL LOSSES, unfixed.**
-   Tiny-K (K=32/64) skinny shapes (`4096×64×64`, `8192×64×64`, `16384×64×32`;
-   `64×4096×64`, `64×8192×64`, `32×16384×64`) where PM's kernel is ~8% slower than
-   autotune's on device time. Only surfaced once we switched to profiler +
-   interleaved + IQR (event timing had hidden it). 6 shapes, sub-millisecond;
-   an open item to debug — the config PM picks vs the autotune winner needs a
-   `pm_config_sweep` on these to see which axis (likely BK/ns at tiny K) is wrong.
+0. **~~LARGE_M_SKINNY / LARGE_N_SKINNY real losses~~ — FIXED (Insight 5).** These
+   tiny-K (K=32/64) shapes were the losses the better measurement uncovered; the
+   root cause was the BK>K block-K bug, now fixed (0.91→1.07, 0.93→1.06). Residual:
+   they win at only 67% (n=3) due to a warps/ns tie-break *within* the correct BK.
 
 1. **Shallow-K num_stages** (e.g. `4096×24576×1536`, K=1536, measures ns2 > ns3):
    the depth-aware stall (Insight 3) still prefers ns3, ~6% off the optimum — but
