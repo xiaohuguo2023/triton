@@ -207,7 +207,7 @@ These have come up in discussion but don't have task IDs yet:
 
 Re-derived GEMM tile selection from physical laws (Little's-law bytes-in-flight +
 clean-wave MFMA efficiency), replacing per-axis tie-break heuristics. Overall
-fp16 win rate vs Triton autotune **83% → 97%**, geomean ~1.44×. Full explainer:
+fp16 win rate vs Triton autotune **83% → 93%**, geomean ~1.44× (profiler device-time). Full explainer:
 [`perf-model-saturation-physics.md`](perf-model-saturation-physics.md).
 
 - ✅ Clean-wave MFMA-efficiency credit/de-rate (`cleanWaveRel`) — fixes MEDIUM
@@ -221,6 +221,14 @@ fp16 win rate vs Triton autotune **83% → 97%**, geomean ~1.44×. Full explaine
   `kDramGranularity` fudge. `7cbd84b1` → unified in `28905f9c`.
 - ✅ Docs: `perf-model-saturation-physics.md` (beginner explainer) + superseded
   Insight 3 in `perfmodel-tuning-insights.md`.
+- ✅ Benchmark methodology upgrade (TensorAtlas-style): `sweep.py` now uses
+  **profiler device-time + interleaved + IQR** instead of HIP-event wall-clock.
+  `a772fe00`. More honest baseline (device-time excludes CPU launch overhead that
+  inflated microsecond kernels) and it **uncovered two real losses** event timing
+  had hidden: `LARGE_M_SKINNY` (0.91) and `LARGE_N_SKINNY` (0.93) — tiny-K skinny
+  shapes, PM kernel ~8% slower than autotune. Corrected overall: geomean ~1.44×,
+  win **83% → 93%** (the earlier 97% was event-inflated). Open residual: debug
+  the 6 skinny shapes.
 
 ## Process
 

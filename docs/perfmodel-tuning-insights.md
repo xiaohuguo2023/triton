@@ -9,7 +9,7 @@ bench results, not intuition.
 > It re-derives tile selection (block-K, num_warps, num_stages, occupancy) from
 > Little's-law saturation + clean-wave MFMA efficiency, and **supersedes Insight 3
 > below** (the linear per-K-iter overhead + `BK<64 ×1.30` penalty) and the
-> `stallAmp`/occupancy heuristics. Overall fp16 win rate 83% → 97%. Read that doc
+> `stallAmp`/occupancy heuristics. Overall fp16 win rate 83% → 93%. Read that doc
 > first for the *why*; this file is the terse per-fix history.
 
 ---

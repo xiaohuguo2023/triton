@@ -74,17 +74,37 @@ some arbitrary tie-break picks the winner — often the wrong one:
 
 The whole 2026-07 effort was: **replace those ties + tie-breaks with real
 physics.** Result on our 471-shape fp16 test suite: **win rate vs Triton's own
-autotuner went 83% → 97%, geomean speedup ~1.44×.**
+autotuner went 83% → 93%, geomean speedup ~1.44×.**
 
 ### How we measure (so numbers are trustworthy)
-For each shape we run PerfModel's top pick AND Triton autotune's pick *in the
-same run* and report the ratio `PM_TF / auto_TF` (>1 means PerfModel picked a
-faster config). Both measured median-of-30–50 on a **verified-idle GPU**
-(`rocm-smi --showuse`, refuse to start if any GPU is busy). The self-normalized
-ratio survives clock drift. **Caveat:** categories with only 3–6 tiny shapes
-(1–5 TFLOPS, sub-millisecond) swing ±20% run-to-run — we always re-confirm those
-with a clean median-of-50 before believing a regression. (Every "regression" we
-saw in a tiny category this pass turned out to be noise.)
+For each shape we run PerfModel's top pick AND Triton autotune's pick and report
+the ratio `PM_TF / auto_TF` (>1 means PerfModel picked a faster config), on a
+**verified-idle GPU** (`rocm-smi --showuse`, refuse to start if any GPU is busy).
+
+**Measurement methodology (updated 2026-07, TensorAtlas-style — this matters a
+lot for small kernels):**
+- **Device-time, via `torch.profiler`**, not HIP-event wall-clock. The profiler
+  reads the actual GPU kernel duration (`self_device_time_total`, from
+  roctracer). Wall-clock includes ~2–4 µs of **CPU launch overhead per call**,
+  which for a 3–5 µs kernel *dominates* the measurement — it both inflates ratios
+  and is unfair if the two configs launch via different wrappers.
+- **Interleaved** — each round measures a short burst of PM, then autotune, then
+  rocBLAS, so all configs see the same thermal/clock state (fair A/B), instead of
+  measuring one fully then the next.
+- **IQR outlier filter** — drop upper (slow throttle/jitter) spikes via the Tukey
+  fence, average the rest.
+
+> **⚠️ Hard lesson (2026-07).** An earlier version of this doc claimed the tiny
+> SMALL/`*_SKINNY` categories "all win 1.5–2.1× and the sweep losses were noise."
+> **That was wrong** — an artifact of HIP-event wall-clock timing. When we
+> switched to profiler device-time + interleaved + IQR, two of those categories
+> turned out to be **real losses**: `LARGE_M_SKINNY` (0.91) and `LARGE_N_SKINNY`
+> (0.93) — tiny-K (K=32/64) skinny shapes where PM's *kernel* is genuinely ~8%
+> slower than autotune's. The old "clean" event debug had compared PM's raw
+> kernel launch against autotune's *wrapper* (unfair CPU overhead) and measured
+> wall-clock (launch overhead), inflating PM to a fake 1.5×. **Lesson: for
+> microsecond kernels, only device-time is trustworthy; wall-clock lies.** These
+> 6 skinny shapes are a genuine open residual (see Part 6).
 
 ---
 
@@ -395,20 +415,31 @@ still uses the older `1/occupancy` treatment (deliberately, it's validated).
 
 ## Part 4 — Results (fp16, 471-shape tutorial suite, PerfModel vs Triton autotune)
 
-`PM/auto` = geomean speedup of PerfModel's pick over autotune's pick (>1 = better).
+`PM/auto` = geomean device-time speedup of PerfModel's pick over autotune's pick
+(>1 = better). **Measured with the profiler + interleaved + IQR methodology
+above** — the honest numbers (the earlier event-timing table over-stated the
+tiny-shape rows).
 
 | category | n | PM/auto | win% | which physics carried it |
 |---|--:|--:|--:|---|
-| LARGE_NK | 261 | 1.59 | 97% | Insights 2 & 4 |
-| MEDIUM | 53 | 1.11 | 94–98% | Insight 1 |
-| VERY_LARGE | 49 | 1.17 | 98–100% | (already good; unchanged) |
-| LARGE_K | 28 | 1.87 | 100% | Insight 4 |
-| LARGE | 18 | 1.16 | 100% | Insight 1 |
-| LARGE_MK | 18 | 1.43 | 100% | Insight 4 |
-| LARGE_N | 14 | 1.41 | 100% | Insights 2 & 3 |
+| LARGE_NK | 261 | 1.60 | 92% | Insights 2 & 4 |
+| MEDIUM | 53 | 1.12 | 98% | Insight 1 |
+| VERY_LARGE | 49 | 1.17 | 98% | (already good; unchanged) |
+| LARGE_K | 28 | 1.96 | 100% | Insight 4 |
+| LARGE | 18 | 1.17 | 100% | Insight 1 |
+| LARGE_MK | 18 | 1.45 | 94% | Insight 4 |
+| LARGE_N | 14 | 1.15 | 100% | Insights 2 & 3 |
 | LARGE_MN | 13 | 1.12 | 100% | (stable) |
-| SMALL / *_SKINNY | 3–6 | 1.2–2.1 | (noisy) | measurement noise, not the model |
-| **overall (n-weighted)** | **471** | **~1.44** | **97%** | |
+| SMALL | 6 | 1.13 | 83% | (mostly ties/wins) |
+| LARGE_K_SKINNY | 3 | 2.07 | 100% | Insight 4 |
+| **LARGE_M_SKINNY** | 3 | **0.91** | **0%** | **real loss — open residual** |
+| **LARGE_N_SKINNY** | 3 | **0.93** | **0%** | **real loss — open residual** |
+| LARGE_M | 2 | 1.41 | 100% | |
+| **overall (n-weighted)** | **471** | **~1.44** | **93%** | |
+
+(Before this work, overall win rate was ~83% with MEDIUM/VERY_LARGE tie-break
+*regressions*. The 97% figure quoted in earlier drafts was event-timing-inflated;
+93% is the device-time truth.)
 
 For reference, before this work overall win rate was **83%**, and MEDIUM /
 VERY_LARGE had tie-break *regressions*.
@@ -436,13 +467,28 @@ Recorded because each looked reasonable and cost real time:
 **The discipline that made this work:** *every* core-model change was gated on a
 full 13-category A/B sweep, and any change that was net-negative on the reliable
 (n≥13) categories was **reverted, not shipped** — even when it fixed the target
-category. Tiny-category (n≤6) swings were always re-measured clean before acting.
+category.
+
+5. **HIP-event wall-clock re-measurement of tiny shapes** (to "confirm" the n≤6
+   categories). We did this repeatedly and it lied — event wall-clock includes
+   launch overhead and, when PM and autotune launch via different wrappers, is
+   *unfair*. It told us the skinny categories won 1.5×; profiler device-time
+   showed two of them are ~8% **losses**. Lesson: re-measuring clean is not
+   enough — you must measure the *right thing* (device time), interleaved, IQR.
 
 ---
 
 ## Part 6 — Honest remaining residuals
 
-Not everything is perfect; these are known and deliberately left:
+Not everything is perfect; these are known:
+
+0. **LARGE_M_SKINNY (0.91) and LARGE_N_SKINNY (0.93) — REAL LOSSES, unfixed.**
+   Tiny-K (K=32/64) skinny shapes (`4096×64×64`, `8192×64×64`, `16384×64×32`;
+   `64×4096×64`, `64×8192×64`, `32×16384×64`) where PM's kernel is ~8% slower than
+   autotune's on device time. Only surfaced once we switched to profiler +
+   interleaved + IQR (event timing had hidden it). 6 shapes, sub-millisecond;
+   an open item to debug — the config PM picks vs the autotune winner needs a
+   `pm_config_sweep` on these to see which axis (likely BK/ns at tiny K) is wrong.
 
 1. **Shallow-K num_stages** (e.g. `4096×24576×1536`, K=1536, measures ns2 > ns3):
    the depth-aware stall (Insight 3) still prefers ns3, ~6% off the optimum — but

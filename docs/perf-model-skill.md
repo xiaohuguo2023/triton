@@ -28,7 +28,7 @@ Selection overhead: **0.09 ms** (vs autotuning which benchmarks N configs × ~25
 
 **Update (2026-07) — direct vs-autotune sweep (gfx950, 471 fp16 shapes).** After
 the saturation-physics rewrite, PerfModel's top-1 pick beats Triton autotune on
-**97% of shapes, geomean ~1.44×** (up from 83%). The cost model now derives
+**93% of shapes, geomean ~1.44×** (up from 83%). The cost model now derives
 block-K, num_warps, num_stages, and occupancy from Little's-law saturation +
 clean-wave MFMA efficiency rather than tie-breaks. Full explainer + per-category
 table: [`perf-model-saturation-physics.md`](perf-model-saturation-physics.md).
