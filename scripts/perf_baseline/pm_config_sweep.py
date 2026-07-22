@@ -15,12 +15,17 @@ M,N,K,BM,BN=(int(x) for x in sys.argv[1:6])
 hw=pm.HardwareInfo.get(arch)
 prob=pm.GemmProblem(M,N,K,pm.ElemKind.FP16,pm.ElemKind.FP16,pm.ElemKind.FP32,16,16,32)
 cands=pm.generate_candidates(prob,hw,kernel_type=pm.KernelType.Standard)
-def bench_ms(fn,w=15,r=50):
+from torch.profiler import profile as _profile, ProfilerActivity as _PA
+def bench_ms(fn,w=15,r=60):
+    # profiler device-time (excludes launch overhead) — required for sub-ms kernels
     for _ in range(w): fn()
-    torch.cuda.synchronize(); s,e=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True); ts=[]
-    for _ in range(r):
-        s.record(); fn(); e.record(); torch.cuda.synchronize(); ts.append(s.elapsed_time(e))
-    ts.sort(); return ts[len(ts)//2]
+    torch.cuda.synchronize()
+    with _profile(activities=[_PA.CUDA]) as prof:
+        for _ in range(r): fn()
+        torch.cuda.synchronize()
+    tot=0.0
+    for ev in prof.key_averages(): tot += getattr(ev,"self_device_time_total",0.0) or 0.0
+    return (tot/r)/1000.0
 def tflops(ms): return 2*M*N*K/(ms*1e-3)/1e12
 a=torch.randn((M,K),device="cuda",dtype=torch.float16); b=torch.randn((K,N),device="cuda",dtype=torch.float16)
 def bench_cfg(c):

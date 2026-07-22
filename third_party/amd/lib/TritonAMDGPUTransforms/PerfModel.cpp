@@ -1477,25 +1477,41 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // (deeper pipeline needs a smaller BK to saturate). MX/a8w4 and sync copy keep
   // peak BW (their pipeline/traffic model differs); the validated a8w4 path is
   // untouched.
+  // ── Effective software-pipeline depth — ONE definition, used everywhere ─────
+  // A depth-(numStages-1) async pipeline is bounded by TWO things: the LDS buffer
+  // count (numStages-1) AND the number of K-iterations that exist to fill it — you
+  // cannot prefetch iterations that don't exist, so the achievable depth is
+  // min(numStages-1, numKIter). This single quantity governs the DRAM-saturation
+  // outstanding bytes, the Little's-law effMemPerIter, the overlap iter-latency,
+  // AND the MFMA-latency stall, so all of them agree. (Previously each grew its own
+  // ad-hoc numKIter cap — this replaces that sprawl with one physical value.) For
+  // sync copy the TCP (L1) capacity caps in-flight bytes instead of the LDS buffers.
+  // Consequences: deep-K (numKIter ≫ stages) is unchanged; BK=K (numKIter=1) makes
+  // ns2 and ns3 both reach depth 1 → they tie (matching the measured ~equality) and
+  // the tie-break takes the cheaper ns2; BK>K (numKIter<1) is correctly starved.
+  constexpr double tcpSizeBytes = 32768.0; // TCP = 32 KB per CU (GFX9/GFX950)
+  const double dataPerWave =
+      (cfg.numWarps > 0) ? tileBytesABperK / cfg.numWarps : tileBytesABperK;
+  const double tcpDepth =
+      (dataPerWave > 0.0)
+          ? tcpSizeBytes / (std::max(1, cfg.numWarps) * dataPerWave)
+          : static_cast<double>(cfg.numStages - 1);
+  const double bufferDepth =
+      cfg.useAsyncCopy
+          ? static_cast<double>(cfg.numStages - 1)
+          : std::min(static_cast<double>(cfg.numStages - 1), tcpDepth);
+  const double effectivePipelineDepth = std::min(bufferDepth, numKIter);
+
   double dramBwEff = dramBwPerCU;
   if (cfg.useAsyncCopy && dramBwPerCU > 0.0 &&
       !hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc())) {
-    // Effective pipeline depth is capped by the number of K-iterations that
-    // actually exist: you cannot prefetch iterations that aren't there. For a
-    // tiny-K tile where BK >= K (e.g. K=64, BK=256 -> numKIter=0.25) the loop
-    // runs a single masked iteration streaming only K (not BK) elements, so the
-    // outstanding bytes are the TOTAL traffic, not depth×(BM+BN)·BK·2. Without
-    // this cap the saturation term over-credits large BK on tiny-K shapes and
-    // the model wrongly prefers BK256/BK128 over the measured-best BK64/BK32
-    // (LARGE_M_SKINNY / LARGE_N_SKINNY, K=32/64: predicted 157 TF for BK256 vs
-    // measured winner BK64 — an ~8% real loss). Deep-K tiles (numKIter >> depth)
-    // are unchanged.
-    const double depth =
-        std::min(std::max(1.0, static_cast<double>(cfg.numStages - 1)),
-                 std::max(numKIter, 1e-3));
+    // Outstanding DRAM bytes = achievable depth × per-iter DRAM traffic. The
+    // depth bound means a BK>K tile (numKIter<1) keeps only its TOTAL traffic in
+    // flight (not depth×BK), so large BK is no longer falsely credited as
+    // saturated on tiny-K shapes (LARGE_M_SKINNY / LARGE_N_SKINNY, K=32/64).
     const double dramBytesPerIter = tileBytesABperK * (1.0 - l2HitRate);
-    dramBwEff =
-        std::min(dramBwPerCU, depth * dramBytesPerIter / hbmLatencyCycles);
+    dramBwEff = std::min(dramBwPerCU,
+                         effectivePipelineDepth * dramBytesPerIter / hbmLatencyCycles);
   }
 
   double memCycles;
@@ -1532,38 +1548,8 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   //     higher achieved DRAM BW (capped at peak) — so numStages affects even
   //     bandwidth-classified tiles (ns3 > ns2). See the effMemPerIter block below.
   //
-  // Constants (GFX950 / CDNA4):
-  constexpr double tcpSizeBytes = 32768.0; // TCP = 32 KB per CU (GFX9/GFX950)
-  // hbmLatencyCycles is defined above (shared with the DRAM-saturation model).
-
-  // Bytes loaded per K-block iteration, split across numWarps waves in the CTA.
-  const double blockSizeBytes = tileBytesABperK; // A+B tile per K-block (before numKIter)
-  const double dataPerWave =
-      (cfg.numWarps > 0) ? blockSizeBytes / cfg.numWarps : blockSizeBytes;
-
-  // Effective in-flight depth: TCP cap limits how many per-wave requests fit.
-  // Only the numWarps waves of ONE CTA simultaneously issue loads for the
-  // current K-block; co-resident CTAs are at different K-iters in their async
-  // pipeline and don't compete for the same TCP entries. Counting all
-  // VGPR-resident waves on the CU (the previous formula) wrongly penalised
-  // higher-occupancy tiles by dividing TCP capacity among non-competing waves.
-  const int numActiveWaves = std::max(1, cfg.numWarps);
-  const double tcpDepth = (dataPerWave > 0.0 && numActiveWaves > 0)
-                              ? tcpSizeBytes / (numActiveWaves * dataPerWave)
-                              : static_cast<double>(cfg.numStages - 1);
-  // Async-copy (direct global→LDS) stages operands in the numStages LDS buffers
-  // we already account for — it does NOT stream through the TCP/L1, so the TCP
-  // cap does not apply and the achievable in-flight depth is LDS-limited to
-  // numStages-1. This is what lets a deeper-staged pingpong config (ns3) hide
-  // more HBM latency than ns2 for the SAME tile: measured 256x128x64 ns3=1058
-  // vs ns2=966 TF. For sync copy, staging goes through L1 and the TCP cap stands.
-  // NOTE: this only lowers the hbm_latency/depth term; the memPerIter bandwidth
-  // floor in the max() below still binds, so ns3 gets NO benefit on tiles that
-  // are already bandwidth-bound (the benefit is capped where it should be).
-  const double effectivePipelineDepth =
-      cfg.useAsyncCopy
-          ? static_cast<double>(cfg.numStages - 1)
-          : std::min(static_cast<double>(cfg.numStages - 1), tcpDepth);
+  // effectivePipelineDepth, dataPerWave and tcpDepth are defined once above
+  // (before the DRAM-saturation term that also needs the depth) and reused here.
 
   // Iter latency from gluon E2E model:
   //   iter_latency = max(hbm_latency / effective_depth, compute_latency_per_iter)
@@ -1812,6 +1798,11 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
     // ns3 wave-curve (W4/W8 = 1 vs 2 waves × depth 2) still matches the measured
     // +23% (was k=0.4 against wavesPerSimd alone).
     constexpr double kMfmaLatencyWaves = 1.2;
+    // Hiding parallelism = resident waves × achievable pipeline depth. Uses the
+    // single effectivePipelineDepth (already bounded by numKIter), floored at 1
+    // because at least one K-iteration's MFMAs always run: so ns3 gets no
+    // fictional depth benefit over ns2 when the loop is too short to fill it
+    // (tiny-K), while deep-K keeps the full ns3 depth. No separate cap here.
     const double hiding = static_cast<double>(est.wavesPerSimd) *
                           std::max(1.0, effectivePipelineDepth);
     mfmaLatencyStall = 1.0 + kMfmaLatencyWaves / hiding;
@@ -2122,8 +2113,28 @@ rankConfigs(const GemmProblem &prob, llvm::ArrayRef<TritonGemmConfig> configs,
       if (configs[a.idx].numWarps != configs[b.idx].numWarps)
         return configs[a.idx].numWarps < configs[b.idx].numWarps;
     } else {
+      // Prefer more pipeline stages — but only stages the K-loop can actually
+      // FILL. A depth-(numStages-1) software pipeline needs >= numStages-1
+      // K-iterations to reach steady state; when numKIter is smaller (tiny-K,
+      // e.g. K <= blockK -> numKIter=1) the extra stages are pure prologue / LDS
+      // cost with no steady-state benefit, and measured ns2 is equal-or-better
+      // than ns3. So rank on USABLE stages = min(numStages, floor(numKIter)+1):
+      // deep-K keeps preferring ns3, tiny-K ties ns2/ns3 there and then prefers
+      // FEWER actual stages (less prologue). Fixes LARGE_M_SKINNY / LARGE_N_SKINNY
+      // (numKIter=1) that were picking ns3 where ns2 wins. Then larger blockK,
+      // then more warps (unchanged).
+      auto usableStages = [&](const TritonGemmConfig &c) {
+        const double nk =
+            c.blockK > 0 ? static_cast<double>(prob.K) / c.blockK : 1.0;
+        const int cap = std::max(2, static_cast<int>(std::floor(nk)) + 1);
+        return std::min(c.numStages, cap);
+      };
+      const int ua = usableStages(configs[a.idx]);
+      const int ub = usableStages(configs[b.idx]);
+      if (ua != ub)
+        return ua > ub;
       if (configs[a.idx].numStages != configs[b.idx].numStages)
-        return configs[a.idx].numStages > configs[b.idx].numStages;
+        return configs[a.idx].numStages < configs[b.idx].numStages;
       if (configs[a.idx].blockK != configs[b.idx].blockK)
         return configs[a.idx].blockK > configs[b.idx].blockK;
       if (configs[a.idx].numWarps != configs[b.idx].numWarps)
