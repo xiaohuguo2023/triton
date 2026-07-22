@@ -409,11 +409,29 @@ reduction, e.g. K=64 with BK=256 → `numKIter = K/BK = 0.25`):
 Both guards fire **only when `BK ≥ K`** (tiny-K tiles); every `K ≥ 256` shape is
 byte-identical. Together they make the model correctly prefer BK64/BK32 for K=32/64.
 
-**Result.** `LARGE_M_SKINNY` 0.91 → 1.07, `LARGE_N_SKINNY` 0.93 → 1.06 (both now
-win), `SMALL` → 1.19 (100%), and even `LARGE_NK` +0.004 (its K=128 members now
-prefer BK128 over a wasteful BK256). Overall win 93% → **95%**. Residual: the
-skinny 67% win is a warps/ns tie-break *within* the now-correct BK — a smaller,
-separate axis.
+**Then rationalized (the clean version).** The two guards above, plus the DRAM
+saturation and MFMA-stall terms, had each grown their *own* `min(depth, numKIter)`
+cap — heuristic sprawl. Replaced with **one** physical quantity:
+
+```
+effectivePipelineDepth = min(numStages - 1, numKIter)
+```
+
+A software pipeline can only reach the depth its loop can fill — bounded by both
+the LDS buffer count *and* the trip count. Computed once and threaded through the
+DRAM-saturation outstanding-bytes, `effMemPerIter`, the overlap iter-latency, and
+the MFMA-latency stall — so they all agree. Consequence for tiny-K: at `BK=K`
+(numKIter=1) ns2 and ns3 both reach depth 1 *everywhere* → they genuinely **tie**
+(which matches the measured equality), and the num_stages tie-break — made
+numKIter-aware (prefer more *usable* stages = `min(numStages, ⌊numKIter⌋+1)`, then
+*fewer* actual stages) — takes the cheaper **ns2**. Deep-K is byte-identical
+(`min(numStages-1, numKIter) = numStages-1`).
+
+**Result.** `LARGE_M_SKINNY` 0.91 → **1.14 (100% win)**, `LARGE_N_SKINNY` 0.93 →
+**1.10 (100% win)** — the residual warps/ns tie-break is resolved (profiler config
+sweep: all 6 now pick ns2, 3/6 hit the exact oracle, all win 1.06–1.36×). `SMALL`
+→ 1.29 (100%), `LARGE_NK` 1.60 → 1.62. Overall win **95%**, geomean 1.458; 10/13
+categories at 100% win, none in loss.
 
 ---
 
@@ -469,8 +487,8 @@ tiny-shape rows).
 | LARGE_MN | 13 | 1.12 | 100% | (stable) |
 | SMALL | 6 | 1.13 | 83% | (mostly ties/wins) |
 | LARGE_K_SKINNY | 3 | 2.07 | 100% | Insight 4 |
-| LARGE_M_SKINNY | 3 | 1.07 | 67% | fixed (Insight 5) |
-| LARGE_N_SKINNY | 3 | 1.06 | 67% | fixed (Insight 5) |
+| LARGE_M_SKINNY | 3 | 1.14 | 100% | fixed (Insight 5) |
+| LARGE_N_SKINNY | 3 | 1.10 | 100% | fixed (Insight 5) |
 | LARGE_M | 2 | 1.41 | 100% | |
 | **overall (n-weighted)** | **471** | **~1.44** | **95%** | |
 
@@ -521,8 +539,8 @@ Not everything is perfect; these are known:
 
 0. **~~LARGE_M_SKINNY / LARGE_N_SKINNY real losses~~ — FIXED (Insight 5).** These
    tiny-K (K=32/64) shapes were the losses the better measurement uncovered; the
-   root cause was the BK>K block-K bug, now fixed (0.91→1.07, 0.93→1.06). Residual:
-   they win at only 67% (n=3) due to a warps/ns tie-break *within* the correct BK.
+   root cause was the BK>K block-K bug + pipeline-depth heuristics, now fully
+   fixed via the unified effectivePipelineDepth (Insight 5): both 100% win (1.14, 1.10).
 
 1. **Shallow-K num_stages** (e.g. `4096×24576×1536`, K=1536, measures ns2 > ns3):
    the depth-aware stall (Insight 3) still prefers ns3, ~6% off the optimum — but
