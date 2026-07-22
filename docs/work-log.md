@@ -203,6 +203,25 @@ These have come up in discussion but don't have task IDs yet:
 - Symbolic-output mode for PerfModel (borrow from ThroughputSolver, see `docs/perf-model-direction.md` § Related Work)
 - Kernel/arch DSL for non-GEMM patterns (attention, conv) — also from `perf-model-direction.md`
 
+## Phase 13 — Unified saturation physics (2026-07, MI355X 471-shape suite)
+
+Re-derived GEMM tile selection from physical laws (Little's-law bytes-in-flight +
+clean-wave MFMA efficiency), replacing per-axis tie-break heuristics. Overall
+fp16 win rate vs Triton autotune **83% → 97%**, geomean ~1.44×. Full explainer:
+[`perf-model-saturation-physics.md`](perf-model-saturation-physics.md).
+
+- ✅ Clean-wave MFMA-efficiency credit/de-rate (`cleanWaveRel`) — fixes MEDIUM
+  large-tile picks + tiny-square over-prediction. `a66c907c` (+ revert `2fa8be15`).
+- ✅ Little's-law occupancy penalty (bytes-in-flight, not CTA count) — fixes
+  LARGE_N (71%→100%) + LARGE_NK tiny-M. `522c08ec`, `563cd41`.
+- ✅ MFMA latency-hiding stall `1 + k/(wavesPerSimd·pipelineDepth)` — ranks
+  num_warps (W8>W4) AND num_stages (ns3>ns2 compute-bound). `5fd8539a`, `5b73fb56`.
+- ✅ Block-K via Little's-law DRAM saturation (`memoryCycles` uses achieved BW,
+  `hbmLatency` 1000→2000) — fixes LARGE_MK (83%→100%), removes the interim
+  `kDramGranularity` fudge. `7cbd84b1` → unified in `28905f9c`.
+- ✅ Docs: `perf-model-saturation-physics.md` (beginner explainer) + superseded
+  Insight 3 in `perfmodel-tuning-insights.md`.
+
 ## Process
 
 - This log is updated when work lands. New tasks go in the appropriate phase section as `⏳`, flip to `🔄` when started, `✅` when done.

@@ -4,6 +4,14 @@ Captured during the regression-fix work for the tutorial shape sweep. Each
 insight is grounded in empirical rocprofv3 measurements and HIP-event
 bench results, not intuition.
 
+> **See also — [`perf-model-saturation-physics.md`](perf-model-saturation-physics.md)**
+> (2026-07): a beginner-friendly, worked-example explainer of the current model.
+> It re-derives tile selection (block-K, num_warps, num_stages, occupancy) from
+> Little's-law saturation + clean-wave MFMA efficiency, and **supersedes Insight 3
+> below** (the linear per-K-iter overhead + `BK<64 ×1.30` penalty) and the
+> `stallAmp`/occupancy heuristics. Overall fp16 win rate 83% → 97%. Read that doc
+> first for the *why*; this file is the terse per-fix history.
+
 ---
 
 ## Insight 0 — Measurement methodology: the same kernel reads 2× apart
@@ -145,6 +153,12 @@ Only BK=128 (1 wave/SIMD) gets the cliff penalty.
 ---
 
 ## Insight 3 — Linear per-K-iter overhead alone can't capture BK choice
+
+> **⚠️ SUPERSEDED (2026-07).** The `BK<64 ×1.30` penalty and linear per-K-iter
+> overhead below are replaced by the Little's-law DRAM-saturation model — see
+> Insight 4 in [`perf-model-saturation-physics.md`](perf-model-saturation-physics.md).
+> The finding here ("a single monotonic term can't capture BK") was *correct* and
+> is exactly why the real fix is memory-side saturation, not a per-iter penalty.
 
 **Problem:** With perKIter=500, model picks BK=128 (fewer iters → less
 penalty). With perKIter=200, picks BK=32 (high occupancy + low
