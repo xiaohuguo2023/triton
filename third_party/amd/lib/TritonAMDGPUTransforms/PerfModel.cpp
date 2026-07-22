@@ -1326,8 +1326,18 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
     // (model assumes all 4 SIMDs always work on the tile).
     const int activeSimdsPerCTA =
         std::max(1, std::min(cfg.numWarps, hw.numSimdPerCU));
+    // Compute runs at least ONE full K-block. When BK > K (tiny-K tiles, e.g.
+    // K=64 with BK=256 → exact numKIter=0.25) the loop still executes one masked
+    // iteration and the MFMAs run over the padded BK, so the real compute is a
+    // full BK block (only K/BK of it useful). Charge that by flooring numKIter at
+    // 1; exact fractional numKIter is kept for BK ≤ K (last-partial-block is a
+    // small ranking correction). Without this the model under-charges large-BK on
+    // tiny-K shapes and ties BK256 with BK64, then the tie-break picks the bigger
+    // BK — but BK256 does ~4× the (masked) work, so BK64 is really faster
+    // (LARGE_M_SKINNY / LARGE_N_SKINNY, K=32/64).
+    const double numKIterCompute = std::max(1.0, numKIter);
     est.computeCycles =
-        static_cast<double>(numMfmaPerKBlock) * numKIter
+        static_cast<double>(numMfmaPerKBlock) * numKIterCompute
         * info.throughputCycles / activeSimdsPerCTA;
     // MFMA lane-utilization (Fix 6a + Fix 11):
     //
@@ -1470,8 +1480,19 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   double dramBwEff = dramBwPerCU;
   if (cfg.useAsyncCopy && dramBwPerCU > 0.0 &&
       !hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc())) {
+    // Effective pipeline depth is capped by the number of K-iterations that
+    // actually exist: you cannot prefetch iterations that aren't there. For a
+    // tiny-K tile where BK >= K (e.g. K=64, BK=256 -> numKIter=0.25) the loop
+    // runs a single masked iteration streaming only K (not BK) elements, so the
+    // outstanding bytes are the TOTAL traffic, not depth×(BM+BN)·BK·2. Without
+    // this cap the saturation term over-credits large BK on tiny-K shapes and
+    // the model wrongly prefers BK256/BK128 over the measured-best BK64/BK32
+    // (LARGE_M_SKINNY / LARGE_N_SKINNY, K=32/64: predicted 157 TF for BK256 vs
+    // measured winner BK64 — an ~8% real loss). Deep-K tiles (numKIter >> depth)
+    // are unchanged.
     const double depth =
-        std::max(1.0, static_cast<double>(cfg.numStages - 1));
+        std::min(std::max(1.0, static_cast<double>(cfg.numStages - 1)),
+                 std::max(numKIter, 1e-3));
     const double dramBytesPerIter = tileBytesABperK * (1.0 - l2HitRate);
     dramBwEff =
         std::min(dramBwPerCU, depth * dramBytesPerIter / hbmLatencyCycles);
