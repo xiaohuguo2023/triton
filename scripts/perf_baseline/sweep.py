@@ -45,19 +45,107 @@ sys.path.insert(0, str(Path(__file__).parent))
 from shapes import ALL_SHAPES
 
 
+import math as _math
+import statistics as _stats
+from torch.profiler import profile, ProfilerActivity
+
+
+def filter_outliers_iqr(values, min_samples=5, iqr_multiplier=1.5):
+    """Drop UPPER outliers via the IQR (Tukey fence) method — same as TensorAtlas
+    (utils/timing_stats.py). Only slow spikes (thermal throttle / scheduling
+    jitter) are removed; fast times are never outliers for timing. Falls back to
+    the original list if too few samples survive. Returns (filtered, n_removed)."""
+    vals = list(values)
+    if not vals:
+        return [], 0
+    if len(vals) < 5:
+        return vals, 0
+    q = _stats.quantiles(vals, n=4)
+    q1, q3 = q[0], q[2]
+    upper = q3 + iqr_multiplier * (q3 - q1)
+    filt = [v for v in vals if v <= upper]
+    if len(filt) >= min_samples:
+        return filt, len(vals) - len(filt)
+    return vals, 0
+
+
+def _burst_device_ms(fn, iters):
+    """Mean GPU device-time per call (ms) over a short profiled burst."""
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            fn()
+        torch.cuda.synchronize()
+    total_us = 0.0
+    for ev in prof.key_averages():
+        total_us += getattr(ev, "self_device_time_total", 0.0) or 0.0
+    return (total_us / iters) / 1000.0 if iters else float("inf")
+
+
+def interleaved_bench_profiler(fns, rounds=10, iters=6, warmup=10):
+    """Interleaved, IQR-filtered device-time benchmark (TensorAtlas methodology,
+    on profiler timing). Each ROUND profiles a short burst of every fn in turn —
+    fn0, fn1, fn2, fn0, fn1, fn2, ... — so all configs experience the same
+    thermal/clock state (fair A/B), unlike measuring one fully then the next.
+    Per-round device-times are IQR-filtered (drop throttle spikes) and averaged.
+    Device-time (not wall-clock) excludes CPU launch overhead — essential for the
+    microsecond SMALL/*_SKINNY kernels where launch overhead dominated the ratio
+    and produced phantom regressions. Returns one mean ms per fn (None if failed).
+    """
+    n = len(fns)
+    for fn in fns:                       # warm all (compile, cache)
+        for _ in range(warmup):
+            try:
+                fn()
+            except Exception:
+                pass
+    torch.cuda.synchronize()
+    samples = [[] for _ in range(n)]
+    failed = set()
+    for _ in range(rounds):
+        for j, fn in enumerate(fns):
+            if j in failed:
+                continue
+            try:
+                samples[j].append(_burst_device_ms(fn, iters))
+            except Exception:
+                failed.add(j)
+    out = []
+    for j in range(n):
+        finite = [x for x in samples[j] if _math.isfinite(x) and x > 0]
+        if not finite:
+            out.append(None)
+            continue
+        filt, _ = filter_outliers_iqr(finite)
+        out.append(_stats.mean(filt) if filt else None)
+    return out
+
+
 def bench_ms(fn, warmup=20, repeat=50):
-    """Median ms over `repeat` runs after `warmup`."""
+    """GPU kernel time per call (ms), via torch.profiler device-side timing.
+
+    Replaces HIP-event wall-clock timing (2026-07). Rationale: for microsecond
+    kernels (SMALL, *_SKINNY, tiny-M shapes — 3-5 us) the per-launch wall-clock
+    is dominated by ~2-4 us of CPU launch overhead, which (a) INFLATES the
+    PM/autotune ratio (wall-clock ≈ kernel + launch, so the launch term swamps a
+    tiny kernel) and (b) is noisy enough at median-of-50 to flip a shape across
+    1.0 — the source of the phantom SMALL/*_SKINNY "regressions". The profiler
+    reads the device-side kernel duration directly (roctracer), excluding launch
+    overhead and CPU jitter, so it is both more accurate and far more stable for
+    short kernels; for large (ms-scale) kernels it agrees with event timing.
+
+    Sums self device-time over the profiled window and divides by `repeat` — this
+    captures all GPU work per call (incl. any split-K reduction kernel)."""
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
-    s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    times = []
-    for _ in range(repeat):
-        s.record(); fn(); e.record()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(repeat):
+            fn()
         torch.cuda.synchronize()
-        times.append(s.elapsed_time(e))
-    times.sort()
-    return times[len(times) // 2]
+    total_us = 0.0
+    for ev in prof.key_averages():
+        total_us += getattr(ev, "self_device_time_total", 0.0) or 0.0
+    return (total_us / repeat) / 1000.0  # us -> ms/call
 
 
 def to_tflops(M, N, K, ms):
@@ -75,15 +163,21 @@ def measure_shape(M, N, K, dtype=torch.float16):
     b = torch.randn((K, N), device="cuda", dtype=dtype)
     row = {"M": M, "N": N, "K": K}
 
-    # (1) PerfModel pick — pre-pick config, bench only the kernel
+    # Build the three callables, then bench them INTERLEAVED so PM / autotune /
+    # rocBLAS all see the same thermal state (fair A/B ratio) with IQR-filtered
+    # device-time. (2026-07: replaced 3 separate sequential bench_ms calls, which
+    # let clock drift bias the ratio and — via wall-clock launch overhead — mis-
+    # ranked microsecond kernels.)
+    call_pm = call_auto = call_rb = None
+
+    # (1) PerfModel pick — pre-pick config, bench only the kernel launch
     try:
         from triton.backends.amd.amd_gemm_selector import (
             pick_gemm_config, config_to_kernel_kwargs, current_amd_arch,
         )
         arch  = current_amd_arch()
         dtype_str = "fp16" if dtype == torch.float16 else "bf16"
-        cfgs  = pick_gemm_config(M, N, K, dtype_str, arch, top_k=1)
-        cfg   = cfgs[0]
+        cfg   = pick_gemm_config(M, N, K, dtype_str, arch, top_k=1)[0]
         kw    = config_to_kernel_kwargs(cfg)
         c     = torch.empty((M, N), device="cuda", dtype=dtype)
         grid  = (triton.cdiv(M, cfg.block_m) * triton.cdiv(N, cfg.block_n),)
@@ -95,32 +189,27 @@ def measure_shape(M, N, K, dtype=torch.float16):
                 b.stride(0), b.stride(1),
                 c.stride(0), c.stride(1),
                 ACTIVATION="", **kw)
-
-        ms = bench_ms(call_pm)
-        row["pm_ms"] = ms
-        row["pm_tflops"] = to_tflops(M, N, K, ms)
         row["pm_cfg"] = f"BM={cfg.block_m},BN={cfg.block_n},BK={cfg.block_k},W={cfg.num_warps},S={cfg.num_stages}"
     except Exception as ex:
-        row["pm_ms"] = None
         row["pm_err"] = str(ex)[:80]
 
-    # (2) Triton autotune (tutorial 18 configs)
-    try:
-        ms = bench_ms(lambda: tut.matmul(a, b))
-        row["auto_ms"] = ms
-        row["auto_tflops"] = to_tflops(M, N, K, ms)
-    except Exception as ex:
-        row["auto_ms"] = None
-        row["auto_err"] = str(ex)[:80]
+    call_auto = lambda: tut.matmul(a, b)
+    call_rb   = lambda: torch.matmul(a, b)
 
-    # (3) rocBLAS reference (torch.matmul on AMD lowers to hipBLASLT/rocBLAS)
+    fns   = [call_pm, call_auto, call_rb]
+    names = ["pm", "auto", "rb"]
+    valid = [(nm, fn) for nm, fn in zip(names, fns) if fn is not None]
     try:
-        ms = bench_ms(lambda: torch.matmul(a, b))
-        row["rb_ms"] = ms
-        row["rb_tflops"] = to_tflops(M, N, K, ms)
+        times = interleaved_bench_profiler([fn for _, fn in valid])
     except Exception as ex:
-        row["rb_ms"] = None
-        row["rb_err"] = str(ex)[:80]
+        times = [None] * len(valid)
+        row["bench_err"] = str(ex)[:80]
+    for (nm, _), ms in zip(valid, times):
+        if ms is None:
+            row[f"{nm}_ms"] = None
+            continue
+        row[f"{nm}_ms"] = ms
+        row[f"{nm}_tflops"] = to_tflops(M, N, K, ms)
 
     # Ratios
     if row.get("pm_tflops") and row.get("auto_tflops"):
