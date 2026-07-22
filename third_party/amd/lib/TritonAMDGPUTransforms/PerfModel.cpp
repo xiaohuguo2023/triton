@@ -1459,6 +1459,25 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   }
   est.memoryCycles = memCycles;
 
+  // DRAM transfer-granularity de-rate (dense). Even when the software pipeline
+  // keeps HBM saturated (Little's law below), SMALL block-K wastes bandwidth:
+  // each k-iteration streams a shorter A/B burst, so partial-cache-line / DRAM
+  // row-activation overhead is a larger fraction of the transfer. The traffic/
+  // peak-BW model above is BK-invariant (total traffic is the same), so it ties
+  // BK — but measured memory-bound deep-K tiles rise monotonically with BK
+  // (16384x256x7168 BM128BN128: BK32->64->128 = 575->636->696 TF, +21%). Model
+  // achieved BW as peak × BK/(BK+kGran), i.e. memCycles × (1 + kGran/BK): the
+  // de-rate decays with BK and saturates. Binds ONLY on memory-bound tiles
+  // (memCycles enters the roofline only when it exceeds compute), so compute-
+  // bound shapes are untouched; and it is tiny for large BK. Fixes the deep-K
+  // BK32-vs-BK64 losses (LARGE_MK 16384x256x7168, 32768x128x5120, ...).
+  // kGran≈10 calibrated from the measured BK bandwidth curve. Dense only.
+  if (!hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc()) &&
+      cfg.blockK > 0) {
+    constexpr double kDramGranularity = 5.0;
+    est.memoryCycles *= 1.0 + kDramGranularity / static_cast<double>(cfg.blockK);
+  }
+
   // ── Step 4: pipeline overlap (gluon memory_bandwidth_model.md) ──────────────
   //
   // Effective pipeline depth and iter latency:
