@@ -1446,37 +1446,49 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // free (served at DRAM bandwidth) — equivalent to disabling the L2 model.
   // Set peakL2BwBytesPerCycle after calibration to enable accurate L2 reuse.
   const double dramBwPerCU = hw.peakMemBwBytesPerCycle / std::max(hw.numCUs, 1);
+
+  // HBM round-trip latency in cycles (gfx950/CDNA4). Governs BOTH how many
+  // pipeline stages are needed to hide latency (overlap, below) AND — via
+  // Little's law — how many bytes must be in flight to SATURATE HBM bandwidth.
+  // Back-solved from measured memory-bound BK/BW curves (e.g. 16384x256x7168
+  // ns2: BK32/BK64/BK128 = 0.65/0.97/1.0 of peak BW) at ~2000 cycles; the older
+  // 1000 saturated too early (tied all BK). One physical constant, used in both
+  // places.
+  constexpr double hbmLatencyCycles = 2000.0;
+
+  // Achieved DRAM bandwidth via Little's law (dense async): sustained BW =
+  // min(peak, outstanding_bytes / round_trip_latency), where outstanding =
+  // pipeline_depth × DRAM bytes streamed per k-iteration. A small BK (few bytes
+  // per iter) or a shallow pipeline (small ns) keeps too few bytes in flight to
+  // saturate HBM, so achieved BW < peak and memoryCycles rises. This makes BK
+  // *and* ns fall out of the SAME saturation law as the occupancy model —
+  // replacing the ad-hoc `1 + kGran/BK` granularity de-rate with first-
+  // principles physics, and getting the measured ns×BK coupling for free
+  // (deeper pipeline needs a smaller BK to saturate). MX/a8w4 and sync copy keep
+  // peak BW (their pipeline/traffic model differs); the validated a8w4 path is
+  // untouched.
+  double dramBwEff = dramBwPerCU;
+  if (cfg.useAsyncCopy && dramBwPerCU > 0.0 &&
+      !hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc())) {
+    const double depth =
+        std::max(1.0, static_cast<double>(cfg.numStages - 1));
+    const double dramBytesPerIter = tileBytesABperK * (1.0 - l2HitRate);
+    dramBwEff =
+        std::min(dramBwPerCU, depth * dramBytesPerIter / hbmLatencyCycles);
+  }
+
   double memCycles;
   if (hw.peakL2BwBytesPerCycle > 0.0) {
     const double l2BwPerCU   = hw.peakL2BwBytesPerCycle / std::max(hw.numCUs, 1);
     const double dramTraffic = tileBytesAB * (1.0 - l2HitRate);
     const double l2Traffic   = tileBytesAB * l2HitRate;
-    memCycles = (dramBwPerCU > 0.0 ? dramTraffic / dramBwPerCU : 0.0) +
-                (l2BwPerCU   > 0.0 ? l2Traffic   / l2BwPerCU   : 0.0);
+    memCycles = (dramBwEff > 0.0 ? dramTraffic / dramBwEff : 0.0) +
+                (l2BwPerCU  > 0.0 ? l2Traffic  / l2BwPerCU : 0.0);
   } else {
-    // Uncalibrated: use DRAM bandwidth for all traffic (conservative baseline).
-    memCycles = (dramBwPerCU > 0.0) ? tileBytesAB / dramBwPerCU : 0.0;
+    // Uncalibrated: use (achieved) DRAM bandwidth for all traffic.
+    memCycles = (dramBwEff > 0.0) ? tileBytesAB / dramBwEff : 0.0;
   }
   est.memoryCycles = memCycles;
-
-  // DRAM transfer-granularity de-rate (dense). Even when the software pipeline
-  // keeps HBM saturated (Little's law below), SMALL block-K wastes bandwidth:
-  // each k-iteration streams a shorter A/B burst, so partial-cache-line / DRAM
-  // row-activation overhead is a larger fraction of the transfer. The traffic/
-  // peak-BW model above is BK-invariant (total traffic is the same), so it ties
-  // BK — but measured memory-bound deep-K tiles rise monotonically with BK
-  // (16384x256x7168 BM128BN128: BK32->64->128 = 575->636->696 TF, +21%). Model
-  // achieved BW as peak × BK/(BK+kGran), i.e. memCycles × (1 + kGran/BK): the
-  // de-rate decays with BK and saturates. Binds ONLY on memory-bound tiles
-  // (memCycles enters the roofline only when it exceeds compute), so compute-
-  // bound shapes are untouched; and it is tiny for large BK. Fixes the deep-K
-  // BK32-vs-BK64 losses (LARGE_MK 16384x256x7168, 32768x128x5120, ...).
-  // kGran≈10 calibrated from the measured BK bandwidth curve. Dense only.
-  if (!hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc()) &&
-      cfg.blockK > 0) {
-    constexpr double kDramGranularity = 5.0;
-    est.memoryCycles *= 1.0 + kDramGranularity / static_cast<double>(cfg.blockK);
-  }
 
   // ── Step 4: pipeline overlap (gluon memory_bandwidth_model.md) ──────────────
   //
@@ -1501,10 +1513,7 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   //
   // Constants (GFX950 / CDNA4):
   constexpr double tcpSizeBytes = 32768.0; // TCP = 32 KB per CU (GFX9/GFX950)
-  // HBM round-trip latency in cycles (≈1000 cycles for CDNA/gfx950).
-  // This is the key hardware constant that determines how many pipeline stages
-  // are needed to hide memory latency — calibrated from gluon tutorial analysis.
-  constexpr double hbmLatencyCycles = 1000.0;
+  // hbmLatencyCycles is defined above (shared with the DRAM-saturation model).
 
   // Bytes loaded per K-block iteration, split across numWarps waves in the CTA.
   const double blockSizeBytes = tileBytesABperK; // A+B tile per K-block (before numKIter)
