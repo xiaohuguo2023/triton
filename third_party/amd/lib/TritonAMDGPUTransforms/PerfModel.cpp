@@ -1510,7 +1510,18 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
     // flight (not depth×BK), so large BK is no longer falsely credited as
     // saturated on tiny-K shapes (LARGE_M_SKINNY / LARGE_N_SKINNY, K=32/64).
     const double dramBytesPerIter = tileBytesABperK * (1.0 - l2HitRate);
-    dramBwEff = std::min(dramBwPerCU,
+    // Active-CU aggregate-BW ceiling (first-principles; no fitted coeff). HBM is
+    // a global pool; a partial wave activates activeCUs=min(tiles,numCUs) CUs whose
+    // aggregate BW = min(peak, activeCUs * perCU-Little's-law-rate). Per-CU ceiling
+    // is therefore peak/activeCUs (> the 1/numCUs equal share for a partial wave),
+    // still bounded by the SAME Little's-law term. Measured: a wide BN256 partial
+    // wave (~144 CUs) reaches ~peak; a tiny tile stays Little's-law-limited far
+    // below (no spurious credit). Full waves (tiles>=numCUs) unchanged.
+    const double activeCUs =
+        std::max(1.0, std::min(static_cast<double>(est.totalOutputTiles),
+                               static_cast<double>(hw.numCUs)));
+    const double perActiveCuBw = hw.peakMemBwBytesPerCycle / activeCUs;
+    dramBwEff = std::min(perActiveCuBw,
                          effectivePipelineDepth * dramBytesPerIter / hbmLatencyCycles);
   }
 
@@ -1526,6 +1537,24 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
     memCycles = (dramBwEff > 0.0) ? tileBytesAB / dramBwEff : 0.0;
   }
   est.memoryCycles = memCycles;
+
+  // Fractional last wave (multi-wave only; first-principles, no fitted constant).
+  // For a bandwidth-bound kernel the memory total is total_DRAM/achieved_BW,
+  // independent of wave packing. The model charges memCycles*ceil(numWaves), but
+  // for a MULTI-wave shape the full waves already saturate HBM, so the exact total
+  // is memCycles*(tiles/numCUs), NOT memCycles*ceil(numWaves). Since
+  // tiles/numCUs = numWaves*waveEfficiency, scaling memoryCycles by waveEfficiency
+  // corrects the ceil over-count of the partial LAST wave (e.g. BN256 on N=106496:
+  // 416 tiles = 1.625 waves charged as 2). This lets a wide tile with FEWER tiles
+  // (less total DRAM from fewer A re-reads) win, fixing the huge-N LARGE_NK cluster.
+  // Gated to numWaves>=2: a single partial wave has too few active CUs to saturate
+  // HBM, so it keeps the active-CU per-CU treatment above (an unconditional weff
+  // scaling wrongly over-credits tiny single-wave shapes -> skinny regressions).
+  // Dense only; applied to est.memoryCycles so the roofline max()/classification
+  // below sees the corrected memory (compute-bound tiles are unaffected).
+  if (!hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc()) &&
+      est.numWaves >= 2 && est.waveEfficiency > 0.0)
+    est.memoryCycles *= est.waveEfficiency;
 
   // ── Step 4: pipeline overlap (gluon memory_bandwidth_model.md) ──────────────
   //
@@ -1713,47 +1742,44 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   //     frac_of_peak ~= 2.14 * (BM/(BM+76)) * (BN/(BN+156))   (SSE 0.0025)
   // (operand reuse + MFMA accumulator latency-hiding; the N-tile matters more).
   //
-  // GATE (the key finding of the tile-family ground truth, 47 shapes/13 cats):
-  // the large tile only wins when it still FILLS the machine -- best tile is
-  // BN256 for 17/17 shapes with >=1 full wave, but a NARROW tile for 23/29
-  // single-partial-wave shapes (skinny / small / LARGE_K / small-M LARGE_NK).
-  // So credit ONLY when this candidate covers >= numCUs tiles (>=1 full wave).
-  // A prior UNconditional boost regressed 11/13 categories by over-picking large
-  // tiles on under-filled shapes; the gate is what prevents that.
-  // Normalized to the 128x128 baseline, clamped to [1, peak] so it only lifts
-  // large well-filled tiles and never exceeds the measured 256x256 realized
-  // efficiency (~0.64). Dense (bf16/fp16) only; a8w4 keeps its own de-rate.
-  // Padding guard: don't credit a tile wider/taller than the problem itself
-  // (e.g. BN256 on N=128 wastes half its columns). Require prob dims >= tile
-  // dims so the credited tile is genuinely utilized, not padded. Fixes the
-  // LARGE_M / skinny residual where the fill-gate alone (many M-tiles) let a
-  // padded wide BN through.
+  // FILL-SCALING (replaces the old hard tiles>=numCUs gate). The clean-wave
+  // efficiency is measured at FULL machine fill (M=N=16384, many waves). When a
+  // tile-set only partially fills the machine (a single partial wave, tiles <
+  // numCUs), it realizes that efficiency only in PROPORTION to the CU fraction
+  // it engages; below that, more-parallel SMALLER tiles win (already captured by
+  // numWaves × per-tile MAC count). So ramp the credit linearly with fill:
+  //     credit = 1 + (cleanWaveRel - 1) * min(1, tiles/numCUs)
+  // At >=1 full wave this is the full credit (unchanged from the old gate for
+  // well-filled shapes); at 144/256 tiles (BM128BN256 on 128x36864 / 256x18432,
+  // BM256BN256 on 256x57344) it gives ~0.56 of the credit — enough for the wide
+  // tile to out-rank a boosted sub-128 BM64BN128, which the hard gate (0 credit
+  // at 144 tiles) could not. A hard step at numCUs is unphysical: 255 tiles and
+  // 256 tiles realize near-identical efficiency, not 0 vs full. The old note
+  // that an UNCONDITIONAL (fill=1) boost regressed 11/13 categories still holds
+  // — fill-scaling is precisely the fix: sparse waves get ~no credit.
+  // Normalized to the 128x128 baseline, clamped to [1, peak] (never exceeds the
+  // measured 256x256 realized efficiency ~0.64). Dense only; a8w4 keeps its own
+  // de-rate. Padding guard: don't credit a tile wider/taller than the problem
+  // (prob dims >= tile dims) so the credited tile is genuinely utilized.
   if (!hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc()) &&
-      hw.numCUs > 0 && est.totalOutputTiles >= hw.numCUs &&
-      prob.N >= cfg.blockN && prob.M >= cfg.blockM) {
+      hw.numCUs > 0 && prob.N >= cfg.blockN && prob.M >= cfg.blockM) {
     double largeTile = cleanWaveRel(cfg.blockM, cfg.blockN);
     largeTile = std::min(std::max(largeTile, 1.0), 1.61); // [1, 256x256 peak]
-    mfmaEfficiency *= largeTile;
+    const double fillFrac =
+        std::min(1.0, static_cast<double>(est.totalOutputTiles) / hw.numCUs);
+    mfmaEfficiency *= 1.0 + (largeTile - 1.0) * fillFrac;
   }
 
   // Small-tile de-rate correction. The min-dim de-rate (0.40 * minTileDim/128)
   // is too LENIENT for tiny tiles: a 32x32 tile gets 0.10 but its measured
   // clean-wave efficiency is ~0.07 (cleanWaveRel(32,32)=0.18 of the 128x128
-  // baseline). The model then over-predicts a machine-FILLING tiny square and
-  // ranks it above the wide-BN tile that actually wins -- measured 64x36864x7168
-  // (LARGE_NK, K=16384): PM top-1'd BM32BN32 at 0.41x autotune vs oracle
-  // BM128BN256 1.20x; and 4x24576x1536 (LARGE_N, K=1536): BM32BN32 over the
-  // faster BM16BN128. Replace the lenient de-rate on sub-128 tiles with the
-  // measured clean-wave efficiency (PENALTY only -- min(), never a boost). This
-  // is the symmetric partner of the large-tile credit above (which is fill-gated
-  // because a large tile can waste CUs when it under-fills; a small tile never
-  // does, so the penalty needs no gate). Because the de-rate only enters the
-  // COMPUTE roofline, memory-bound small-tile picks (correct on skinny / tiny-K)
-  // are unaffected -- only over-predicted COMPUTE-bound tinies move. Dense only.
+  // baseline). Replace the lenient de-rate on sub-128 tiles with the measured
+  // clean-wave efficiency (PENALTY only -- min(), never a boost). Symmetric
+  // partner of the large-tile credit above. Dense only.
   if (!hasMxScales(prob.bDesc()) && !hasMxScales(prob.aDesc()) &&
       minTileDim < 128) {
     double rel = std::min(cleanWaveRel(cfg.blockM, cfg.blockN), 1.0);
-    mfmaEfficiency = std::min(mfmaEfficiency, kPeakMfmaEff * rel);
+    mfmaEfficiency = kPeakMfmaEff * rel;  // measured clean-wave eff (BN-weighted); Origami-style HW characterization
   }
 
   // Realized compute roofline: theoretical MFMA cycles inflated by the
@@ -1867,6 +1893,7 @@ PerfEstimate estimatePerf(const GemmProblem &prob, const TritonGemmConfig &cfg,
   // the raw theoretical est.computeCycles: a tile whose realized compute
   // roofline is the true bottleneck must be classified compute-bound so it does
   // NOT eat the memory-bound step occupancy penalty on top of the de-rate.
+  //
   est.isComputeBound = (inflatedComputeCycles >= est.memoryCycles &&
                         inflatedComputeCycles >= est.ldsCycles);
 
