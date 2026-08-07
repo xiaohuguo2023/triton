@@ -674,8 +674,15 @@ bool TargetInfo::supportsDirectToLDSScattering() const {
 bool TargetInfo::requiresAliasInfoForAsyncOps() const {
   switch (getISAFamily()) {
   case ISAFamily::CDNA3:
-  case ISAFamily::CDNA4:
     return true;
+  case ISAFamily::CDNA4:
+    // The no-alias hint is unsound without asyncmark: LLVM drops the vmcnt
+    // wait before a ds_read of direct-to-LDS gathered data, causing stale
+    // reads and GPU faults (Gluon MLA decode paged-KV gather). Upstream
+    // 3.8.x makes it sound via asyncmark (#9883, #10081), but that needs an
+    // LLVM bump we lack on 3.7.x; returning false falls back to conservative,
+    // correct wait insertion. CDNA3 is left unchanged (no reproduced fault).
+    return false;
   default:
     return false;
   }
